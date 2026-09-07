@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "node --watch server.js",
     "start": "node server.js",
-    "check": "node tests/check.mjs"
+    "check": "node tests/check.mjs && node tests/zoho.check.mjs"
   },
   "dependencies": {
     "express": "^4.21.2"
