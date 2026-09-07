@@ -18,8 +18,8 @@
  *     branch has to guess, and a confident wrong answer about someone's leave is worse than a
  *     question.
  */
-import { TOOLS, mayCall, validateArgs, catalogue } from '../services/zoho-people/tools/index.js';
-import { route as llmRoute, available as llmAvailable, modelName } from './llm/gemini.js';
+import { TOOLS, mayCall, validateArgs, catalogue } from '../tools/registry.js';
+import { route as llmRoute, available as llmAvailable, modelName } from '../ai/gemini.js';
 
 /**
  * Mutation intent, refused before anything is routed.

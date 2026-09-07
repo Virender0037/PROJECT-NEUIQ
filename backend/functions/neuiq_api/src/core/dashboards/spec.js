@@ -12,7 +12,7 @@
  * `cleanWidgets` is the gate. It runs on model output AND on every client save, because neither
  * is trusted and `widgets` is a JSON column that will hand back whatever it was given.
  */
-import { sanitize } from './query.service.js';
+import { sanitize } from '../query/engine.js';
 
 export const SPEC_VERSION = 1;
 

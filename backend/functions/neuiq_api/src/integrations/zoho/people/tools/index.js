@@ -1,22 +1,30 @@
 /**
- * The tool registry — the allow-list the orchestrator may call.
+ * The Zoho People tools.
  *
- * Every tool declares four things, and the shape is what makes the guardrails enforceable rather
- * than aspirational:
+ * Moved from services/zoho-people/tools/index.js. The six tools are unchanged — same names, same
+ * params, same scopes, same bodies, same sentences. What left this file is everything that was
+ * never about People: the registry, the rank check, argument validation and the catalogue are now
+ * in core/tools/, and `resolveSubject` is in core/policy/authorize.js because deciding who may
+ * ask about whom is a policy question, not a People one.
  *
- *   params   a schema the orchestrator's arguments are validated against. Not advisory: a call
- *            with an unknown or wrong-typed parameter is refused before it runs.
- *   scope    who may call it at all — 'self' | 'team' | 'admin'. Checked against the caller's
- *            role by the registry, never by the tool body and never by the model.
+ * Each tool still declares the same four things, and the shape is what makes the guardrails
+ * enforceable rather than aspirational:
+ *
+ *   params   validated by core/tools/validate.js — refuses unknown keys, never drops them
+ *   scope    'self' | 'team' | 'admin', checked by core/tools/registry.js before `run`
  *   run      the fetch. Returns NORMALIZED, FIELD-WHITELISTED data.
  *   say      turns the result into a sentence. Deterministic, so the number in the answer is
  *            always the number the tool returned.
  *
- * That last one is the important one. The model chooses a tool and its parameters; it does not
- * write the figures. `say()` is why a wrong answer here is a code bug rather than a hallucination.
+ * That last one is why a wrong answer here is a code bug rather than a hallucination.
+ *
+ * **Phase 3 note.** `run(args, user)` keeps its current signature. The move to `run(args, ctx)`
+ * with an injected client is what lets these same bodies run against live Zoho, and it lands with
+ * the client — changing the signature now would be churn with nothing to point it at.
  */
-import { dataset, isAdmin } from '../../../dashboards/query.service.js';
+import { dataset } from '../dataset.js';
 import { onLeaveToday, NOW } from '../seed.js';
+import { resolveSubject } from '../../../../core/policy/authorize.js';
 
 /** Field whitelists. A raw employee record carries PII no prompt needs. */
 const publicEmployee = (e) => ({
@@ -29,23 +37,7 @@ const publicEmployee = (e) => ({
 
 const ENTITLEMENT = { Casual: 12, Sick: 8, Earned: 15, Unpaid: 0 };
 
-/** Resolve which employee a request is about, and refuse if the caller may not ask. */
-function resolveSubject(user, employeeId) {
-  if (!employeeId || employeeId === 'me' || employeeId === user.employeeId) return user.employeeId;
-
-  if (isAdmin(user)) return employeeId;
-
-  // A manager may ask about their own reports and nobody else's. This is the check that stops
-  // "show me Priya's leave balance" working for someone who is not her manager.
-  const subject = dataset.employees.find((e) => e.employeeId === employeeId);
-  if (subject && subject.managerId === user.employeeId) return employeeId;
-
-  const err = new Error('You can only see your own records, or your direct reports.');
-  err.status = 403;
-  throw err;
-}
-
-export const TOOLS = {
+export const PEOPLE_TOOLS = {
   'zohoPeople.leaveBalance': {
     label: 'Leave balance',
     sub: 'Remaining days by leave type',
@@ -161,56 +153,3 @@ export const TOOLS = {
       : `Nobody matching "${d.query}".`),
   },
 };
-
-/** Who may call what. 'team' covers managers and admins; 'admin' is admins only. */
-const ROLE_RANK = { employee: 0, manager: 1, hr_admin: 2 };
-const SCOPE_MIN = { self: 0, team: 1, admin: 2 };
-
-export function mayCall(toolName, user) {
-  const tool = TOOLS[toolName];
-  if (!tool) return false;
-  return (ROLE_RANK[user?.role] ?? -1) >= SCOPE_MIN[tool.scope];
-}
-
-/**
- * Validate arguments against the tool's schema.
- *
- * Deliberately tiny — six tools do not need a schema library. What matters is that it REFUSES:
- * an unknown key or a wrong type throws rather than being quietly dropped, because a silently
- * ignored parameter means the answer is about something other than what was asked.
- */
-export function validateArgs(toolName, args = {}) {
-  const schema = TOOLS[toolName].params;
-  const out = {};
-  for (const [key, value] of Object.entries(args)) {
-    if (!(key in schema)) {
-      const e = new Error(`Unknown parameter "${key}" for ${toolName}`);
-      e.status = 400;
-      throw e;
-    }
-    if (value === undefined || value === null || value === '') continue;
-    const type = schema[key].replace('?', '');
-    if (type === 'number' && Number.isNaN(Number(value))) {
-      const e = new Error(`"${key}" must be a number`);
-      e.status = 400;
-      throw e;
-    }
-    out[key] = type === 'number' ? Number(value) : String(value);
-  }
-  for (const [key, type] of Object.entries(schema)) {
-    if (!type.endsWith('?') && out[key] === undefined) {
-      const e = new Error(`"${key}" is required for ${toolName}`);
-      e.status = 400;
-      throw e;
-    }
-  }
-  return out;
-}
-
-/** The catalogue the AI tab renders. Descriptions only — never the tool bodies. */
-export const catalogue = (user) =>
-  Object.entries(TOOLS).map(([tool, t]) => ({
-    tool, label: t.label, sub: t.sub, scope: t.scope,
-    params: Object.keys(t.params),
-    allowed: mayCall(tool, user),
-  }));

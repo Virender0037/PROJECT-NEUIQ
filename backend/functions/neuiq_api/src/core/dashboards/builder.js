@@ -13,7 +13,7 @@
  *    admin-only widget that would 403 on resolve. Offering a tile that cannot load is worse than
  *    not offering it.
  */
-import { schemaFor } from './query.service.js';
+import { schemaFor } from '../query/sources.js';
 import { cleanWidgets } from './spec.js';
 
 const W = {

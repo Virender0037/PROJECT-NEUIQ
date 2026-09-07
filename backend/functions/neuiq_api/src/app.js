@@ -10,16 +10,23 @@
  * HTTP request and reachable from more than one route.
  */
 import express from 'express';
+
+// The composition root, first: it registers every integration's tools and sources into core, and
+// anything below that reads either registry needs that to have happened already.
+import { directory } from './integrations/registry.js';
+
 import {
   requestId, logger, authenticate, errorHandler, notFound, issueToken,
-} from './middleware/index.js';
-import { runQuery, schemaFor, dataset, isAdmin } from './dashboards/query.service.js';
-import { cleanWidgets, cleanTitle, WIDGET_TYPES } from './dashboards/spec.js';
-import { collection, newId } from './platform/store.js';
-import { answer } from './orchestrator/index.js';
-import { catalogue } from './services/zoho-people/tools/index.js';
-import { buildDashboard, available as llmAvailable, modelName } from './orchestrator/llm/gemini.js';
-import { keywordSpec } from './dashboards/builder.js';
+} from './core/middleware/index.js';
+import { runQuery } from './core/query/engine.js';
+import { schemaFor } from './core/query/sources.js';
+import { isAdmin } from './core/policy/roles.js';
+import { cleanWidgets, cleanTitle, WIDGET_TYPES } from './core/dashboards/spec.js';
+import { collection, newId } from './core/platform/store.js';
+import { answer } from './core/orchestrator/index.js';
+import { catalogue } from './core/tools/registry.js';
+import { buildDashboard, available as llmAvailable, modelName } from './core/ai/gemini.js';
+import { keywordSpec } from './core/dashboards/builder.js';
 
 const dashboards = collection('dashboards');
 
@@ -56,7 +63,7 @@ export function createApp() {
   api.get('/health', (req, res) => res.json(ok(req, {
     status: 'up',
     model: llmAvailable() ? modelName() : 'keywords only',
-    employees: dataset.employees.length,
+    employees: directory.count(),
   })));
 
   // ---- auth ----
@@ -66,14 +73,12 @@ export function createApp() {
    * roles rather than making you memorise usernames.
    */
   api.get('/auth/users', (req, res) => res.json(ok(req, {
-    users: dataset.employees
-      .filter((e) => ['alex', 'priya', 'rohit', 'meera', 'arjun'].includes(e.username))
-      .map((e) => ({ username: e.username, name: `${e.firstName} ${e.lastName}`, role: e.role, department: e.department })),
+    users: directory.demoAccounts(),
   })));
 
   api.post('/auth/login', (req, res) => {
     const username = String(req.body?.username || '').toLowerCase();
-    const employee = dataset.employees.find((e) => e.username === username);
+    const employee = directory.byUsername(username);
     if (!employee) {
       return res.status(401).json({ requestId: req.id, success: false, error: 'No such account.' });
     }
@@ -126,7 +131,7 @@ export function createApp() {
         // Headcount is admin-only, so a non-admin sees their own figures rather than a gap -
         // an empty tile reads as broken, and "—" reads as broken-and-hiding-something.
         isAdmin(req.user)
-          ? { name: 'Headcount', value: String(dataset.employees.length) }
+          ? { name: 'Headcount', value: String(directory.count()) }
           : { name: 'My department', value: req.user.department },
         { name: 'Leave days', value: String(leaveDays) },
         { name: 'Pending approvals', value: String(pending) },

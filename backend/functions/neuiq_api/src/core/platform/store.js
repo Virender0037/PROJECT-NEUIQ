@@ -16,7 +16,28 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const DB_DIR = process.env.NEUIQ_DB_DIR || join(HERE, '..', '..', '..', '..', 'db');
+
+/**
+ * The backend root, found by walking up to the directory holding package.json.
+ *
+ * It used to be a fixed count of `..` hops, which silently broke the moment this file moved one
+ * level deeper during the core extraction: the same four hops landed on `backend/functions/db`
+ * instead of `backend/db`, and the store quietly started writing to a new empty directory. Nothing
+ * failed — it just lost every saved dashboard. Anchoring on package.json means where this file
+ * sits no longer changes where the data goes.
+ */
+function backendRoot(from) {
+  let dir = from;
+  for (let i = 0; i < 10; i++) {
+    if (existsSync(join(dir, 'package.json'))) return dir;
+    const up = dirname(dir);
+    if (up === dir) break;
+    dir = up;
+  }
+  return from;
+}
+
+const DB_DIR = process.env.NEUIQ_DB_DIR || join(backendRoot(HERE), 'db');
 
 /** In-memory mirror, so a read does not hit disk on every request. */
 const cache = new Map();

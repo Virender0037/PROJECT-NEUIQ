@@ -9,13 +9,20 @@
  * loudly rather than quietly widen what a caller can reach.
  */
 import assert from 'node:assert/strict';
-import { sanitize, runQuery, schemaFor, SOURCES, isAdmin } from '../functions/neuiq_api/src/dashboards/query.service.js';
-import { cleanWidgets, cleanTitle, WIDGET_TYPES } from '../functions/neuiq_api/src/dashboards/spec.js';
-import { keywordSpec } from '../functions/neuiq_api/src/dashboards/builder.js';
-import { TOOLS, mayCall, validateArgs, catalogue } from '../functions/neuiq_api/src/services/zoho-people/tools/index.js';
-import { keywordRoute, answer } from '../functions/neuiq_api/src/orchestrator/index.js';
-import { issueToken, verifyToken } from '../functions/neuiq_api/src/middleware/index.js';
-import { buildSeed } from '../functions/neuiq_api/src/services/zoho-people/seed.js';
+
+// The composition root, first: it registers every integration's tools and sources into core.
+// Everything below reads one of those registries, so this import has to run before they do.
+import '../functions/neuiq_api/src/integrations/registry.js';
+
+import { sanitize, runQuery } from '../functions/neuiq_api/src/core/query/engine.js';
+import { schemaFor, SOURCES } from '../functions/neuiq_api/src/core/query/sources.js';
+import { isAdmin } from '../functions/neuiq_api/src/core/policy/roles.js';
+import { cleanWidgets, cleanTitle, WIDGET_TYPES } from '../functions/neuiq_api/src/core/dashboards/spec.js';
+import { keywordSpec } from '../functions/neuiq_api/src/core/dashboards/builder.js';
+import { TOOLS, mayCall, validateArgs, catalogue } from '../functions/neuiq_api/src/core/tools/registry.js';
+import { keywordRoute, answer } from '../functions/neuiq_api/src/core/orchestrator/index.js';
+import { issueToken, verifyToken } from '../functions/neuiq_api/src/core/auth/session.js';
+import { buildSeed } from '../functions/neuiq_api/src/integrations/zoho/people/seed.js';
 
 let n = 0;
 const ok = (fn, what) => { fn(); n++; console.log('ok  ', what); };

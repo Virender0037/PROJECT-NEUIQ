@@ -4,66 +4,29 @@
  * The assistant gets broad READ access through a constrained JSON DSL: it can filter, group and
  * aggregate any whitelisted column of any whitelisted source, but it never emits SQL, ZCQL or a
  * field name of its own devising. **The DSL is a menu, not a parser** — every field that reaches
- * the data layer has to appear in SOURCES below first, so there is no injection surface and no
- * write path.
+ * the data layer has to appear in the source registry first, so there is no injection surface and
+ * no write path.
  *
- * Scoping is not optional and not the caller's job. An employee's query is rewritten with a
+ * Scoping is not optional and not the caller's job. A non-admin's query is rewritten with a
  * filter pinning it to their own rows BEFORE it runs, and a source that cannot be pinned that way
  * is refused outright. This is enforced here rather than in the route handler because the AI
  * builder calls the same function — putting it in the route would leave the builder path, which
  * is exactly the path an attacker would use, unguarded.
  *
- * See docs/backend/15-dashboards.md. The client mirror is
- * frontend/src/ui/hybrid/lib/dashboards.js and the two must stay in step.
+ * Moved from dashboards/query.service.js. The logic is unchanged; the only difference is where
+ * the two things it needs come from. Sources arrive from the registry rather than a literal in
+ * this file, and rows arrive from `source.rows()` rather than an imported seed — so the engine no
+ * longer knows that Zoho People exists.
+ *
+ * The client mirror is frontend/src/shared/dashboards/spec.js and the two must stay in step.
+ * See docs/backend/15-dashboards.md.
  */
-import { buildSeed } from '../services/zoho-people/seed.js';
+import { getSource } from './sources.js';
+import { isAdmin } from '../policy/roles.js';
+import { scopeFilters } from '../policy/scope.js';
 
 export const METRICS = ['count', 'sum', 'avg', 'min', 'max'];
 export const OPS = ['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'contains'];
-
-/**
- * The source registry. This object IS the security boundary.
- *
- * `scope(employeeId)` returns the filter that pins a source to one person. A source whose scope
- * is `null` has no owner, and therefore no safe slice — so it is admin-only by construction
- * rather than by remembering to add a flag.
- */
-export const SOURCES = {
-  leave: {
-    label: 'Leave records',
-    collection: 'leave',
-    group: ['month', 'leaveType', 'status', 'departmentId'],
-    numeric: ['days'],
-    scope: (employeeId) => ({ field: 'employeeId', op: 'eq', value: employeeId }),
-  },
-  attendance: {
-    label: 'Attendance',
-    collection: 'attendance',
-    group: ['month', 'status', 'departmentId'],
-    numeric: ['hours', 'lateMinutes'],
-    scope: (employeeId) => ({ field: 'employeeId', op: 'eq', value: employeeId }),
-  },
-  employees: {
-    label: 'Employees',
-    collection: 'employees',
-    group: ['department', 'location', 'designation', 'employmentType'],
-    numeric: ['tenureMonths'],
-    scope: null,
-    adminOnly: true,
-  },
-};
-
-const seed = buildSeed();
-
-/** Admin-ness is a property of the caller's role, never inferred from their job title. */
-export const isAdmin = (user) => user?.role === 'hr_admin';
-
-/** The source list handed to the model: labels and field names only, never rows. */
-export function schemaFor(user) {
-  return Object.entries(SOURCES)
-    .filter(([, s]) => isAdmin(user) || !s.adminOnly)
-    .map(([source, s]) => ({ source, label: s.label, group: s.group, numeric: s.numeric }));
-}
 
 /**
  * Whitelist a spec. Returns null when the source is unknown, which drops the widget entirely.
@@ -74,7 +37,7 @@ export function schemaFor(user) {
  */
 export function sanitize(raw) {
   const q = raw || {};
-  const src = SOURCES[String(q.source)];
+  const src = getSource(q.source);
   if (!src) return null;
 
   const known = new Set([...src.group, ...src.numeric]);
@@ -134,18 +97,13 @@ export function runQuery(raw, user) {
     throw e;
   }
 
-  const src = SOURCES[spec.source];
-  if (src.adminOnly && !isAdmin(user)) {
-    const e = new Error(`"${src.label}" is not readable from this account`);
-    e.status = 403;
-    throw e;
-  }
+  const src = getSource(spec.source);
 
   // ---- SCOPING: rewrite before running, never after ----
-  const filters = [...(spec.filter || [])];
-  if (!isAdmin(user) && src.scope) filters.push(src.scope(user.employeeId));
+  // scopeFilters throws 403 for an admin-only source, so this line is also the refusal.
+  const filters = [...(spec.filter || []), ...scopeFilters(src, user)];
 
-  let rows = seed[src.collection].filter((row) => filters.every((f) => matches(row, f)));
+  let rows = src.rows().filter((row) => filters.every((f) => matches(row, f)));
 
   // No grouping: a single aggregate over the whole set.
   const metric = spec.metric || 'count';
@@ -200,6 +158,3 @@ function aggregate(rows, metric, field) {
     default: return rows.length;
   }
 }
-
-/** The seed, for the tools layer. Exported here so there is one instance, not one per importer. */
-export const dataset = seed;
