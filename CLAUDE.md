@@ -324,32 +324,90 @@ filter on before the query runs, and refuses admin-only sources with a 403.
 
 ## Zoho People integration — current state
 
-**Not connected.** There is no Zoho sandbox, no OAuth client, no HTTP client, no token provider.
+**Built and tested; not yet run against live credentials.** As of `1be147f`, the integration is
+wired end to end — OAuth provider, authenticated HTTP client, envelopes, transformers, live
+sources, live tools, caller-keyed caching. What has not happened is a single real request from
+this codebase: every endpoint was validated with `curl`, and no `.env` in this repo has ever held
+a Zoho credential.
 
-What exists: six read-only tools modelled on the documented API shapes, fed by `seed.js`
-(deterministic, seeded PRNG, fixed `NOW = 2026-09-04`, 50 employees, six months of leave and
-attendance).
+The app runs on the seed until `NEUIQ_DATA_SOURCE=zoho`. There is **no request-time fallback**
+between them: a Zoho failure is a 503, a 403 stays a 403, and an empty result stays empty.
 
-| Tool | Scope | Params |
-| --- | --- | --- |
-| `zohoPeople.leaveBalance` | self | `employeeId?`, `leaveType?` |
-| `zohoPeople.leaveRecords` | self | `employeeId?`, `status?`, `limit?` |
-| `zohoPeople.attendanceSummary` | self | `employeeId?`, `month?` |
-| `zohoPeople.teamOnLeave` | team | — |
-| `zohoPeople.employeeLookup` | team | `name` (required) |
-| `zohoPeople.headcount` | admin | `groupBy?` |
+### Confirmed against the client's India tenant, 2026-09-07
 
-Each tool declares `params` / `scope` / `run` / `say`. `validateArgs` **refuses** an unknown key or
-a wrong type rather than dropping it quietly — a silently ignored parameter means the answer is
-about something other than what was asked.
+| Thing | Confirmed value |
+| --- | --- |
+| Data centre | **India** — `people.zoho.in` |
+| Employee endpoint | `GET /people/api/forms/employee/getRecords` |
+| Employee response path | **`response.result`** — an *array* of objects keyed by record id |
+| Employee scope | `ZOHOPEOPLE.forms.READ` |
+| Leave endpoint | `GET /people/api/v3/leave-tracker/leaves` |
+| Leave params | `from_date`, `to_date`, `date_format=dd-MMM-yyyy`, `data_select` |
+| `data_select` | **`MINE` and `ALL`** both 200 — `ALL` is what makes the service-account model work |
+| Attendance endpoint | `GET /people/api/v3/attendance/entries` |
+| Attendance params | `employee_email_id`, `from_date`, `to_date`, `date_format` |
+| Envelopes | forms = nested, keyed by record id · v3 = `{data, message, status}` |
+| Date format | `dd-MMM-yyyy` on both v3 endpoints — **never ISO** |
 
-**Before writing any real Zoho client, confirm two things** (`docs/backend/README.md` flags both):
-- **The data-centre trap:** a token minted on `accounts.zoho.in` will *not* work against `.com`
-  endpoints.
-- **Which of Zoho's several employee identifiers** each endpoint expects.
+Recorded as evidence in `zoho/people/endpoints.js` and `zoho/_shared/scopes.js`. Anything
+documented-but-untried lives in a separate list and is never sent.
 
-The real tool catalogue depends on which modules, leave types and custom forms the client's org
-actually has. Until there is sandbox access, the current tools are educated guesses.
+### Two mistakes the real payloads caught
+
+Both would have failed **silently**, which is why the allow-list discipline exists:
+
+- `response.result` is an **array** of keyed-record objects. An earlier `length === 1` shortcut
+  would have returned one employee out of fifty.
+- **`Employee_type.id` is a flat key containing a dot**, not a nested `{Employee_type: {id}}`.
+  Reading it as nested left the whole column `undefined` with nothing throwing.
+
+### Transformers
+
+| Module | State |
+| --- | --- |
+| `transformers/leave.js` | **Done** — 15 confirmed fields |
+| `transformers/employee.js` | **Done** — 4 fields out |
+| `transformers/dates.js` | **Done** — `dd-MMM-yyyy` ↔ ISO, fixed English months |
+| `transformers/envelope.js` | **Done** — forms + v3 |
+| `transformers/attendance.js` | **PENDING — refuses with 501** |
+
+**Employee output is exactly four fields:** `recordId`, `email`, `department`, `employmentTypeId`.
+`Date_of_birth`, `Gender` and `Photo` are read and deliberately discarded; everything unlisted is
+dropped. The first real payload already carried date of birth and gender, which is the concrete
+reason this is an allow-list rather than a rename pass.
+
+**Leave's `days` is a number, Zoho's `days` is an object.** The per-date detail is preserved as
+`dayBreakdown`; writing Zoho's object into `days` would make every leave chart read zero.
+
+### Tools — six, two implementations, one contract
+
+Seed tools are synchronous; live tools are async. Same names, scopes, params and `say()`, asserted
+by test. Selected at boot by `NEUIQ_DATA_SOURCE`; nothing above the manifest knows which is active.
+
+| Tool | Scope | Seed | Live |
+| --- | --- | --- | --- |
+| `zohoPeople.leaveBalance` | self | ✅ | ✅ |
+| `zohoPeople.leaveRecords` | self | ✅ | ✅ |
+| `zohoPeople.teamOnLeave` | team | ✅ | ✅ |
+| `zohoPeople.attendanceSummary` | self | ✅ | ⏸ **501 pending** |
+| `zohoPeople.headcount` | admin | ✅ | ⚠️ department only |
+| `zohoPeople.employeeLookup` | team | ✅ | ⚠️ matches on **email** |
+
+The two live caveats are missing data, not shortcuts: no location/designation field exists on a
+live employee record, so `headcount` downgrades an unavailable `groupBy` and reports
+`downgraded: true` rather than charting a bar labelled `undefined`; and no name field exists, so
+`employeeLookup` matches on email and returns `matchedOn: 'email'`.
+
+**`say()` is unchanged by any of this.** The model picks a tool, the tool fetches, the tool writes
+the sentence — a wrong figure is a code bug, not a hallucination.
+
+### Team hierarchy is OFF in live mode, and fails closed
+
+No reporting field appeared in the employee payload. The seed *has* one, and leaving it wired up
+would mean deciding a real authorization question from generated demo data — a manager reading a
+"direct report" that exists only in the seed. So the live directory's `byId` returns `null`,
+`resolveSubject` finds no subject and throws **403**. Self-reads and admin reads are unaffected;
+only the undecidable case is refused. Restored by confirming a reporting field, not by writing code.
 
 ---
 
@@ -546,19 +604,23 @@ be skipped for want of a bundler. **Do not add imports to `spec.js`.**
 ## Testing
 
 ```bash
-npm run check                 # from root: both suites
-cd backend  && npm run check  # 65 assertions  -> "all 65 backend checks pass"
-cd frontend && npm run check  # 27 assertions  -> "all 27 contract checks pass"
+npm run check                 # from root: all three suites
+cd backend  && npm run check  # runs BOTH backend suites, in order:
+                              #   tests/check.mjs       ->  "all 65 backend checks pass"
+                              #   tests/zoho.check.mjs  ->  "all 218 zoho integration checks pass"
+cd frontend && npm run check  #   test/dashboards.check.mjs -> "all 27 contract checks pass"
 ```
 
-Both were run and pass at these counts. No framework, no mocks — plain `assert/strict` against the
-real modules, exit 1 on any failure.
+**310 assertions total.** All three were run and pass at these counts. No framework, no mocks —
+plain `assert/strict` against the real modules, exit 1 on any failure.
 
 What is asserted is chosen deliberately: **the things that are security boundaries**, not the
-things that are easy to test. Backend coverage spans the seed's determinism and referential
-integrity, `sanitize` rejection, scoping by role, admin-only refusal, `cleanWidgets`, the keyword
-router and builder, tool arg validation, `mayCall`, the write guard, and token
-signing/tamper-resistance.
+things that are easy to test. `check.mjs` covers the seed's determinism and referential integrity,
+`sanitize` rejection, scoping by role, admin-only refusal, `cleanWidgets`, the keyword router and
+builder, tool arg validation, `mayCall`, the write guard, and token signing/tamper-resistance.
+`zoho.check.mjs` covers the same class of thing for the integration: 403 never retried or softened,
+no error offering a seed fallback, production refusing to boot on seed, secrets never surviving
+redaction, unconfirmed things refusing rather than guessing, and PII never surviving a transformer.
 
 **If the whitelist stops rejecting or scoping stops applying, that must fail loudly.** Do not
 "fix" a failing assertion by loosening the expectation.
@@ -672,16 +734,93 @@ Neither is a coding task, and neither can be worked around.
    `employee_zoho_ids` (erecno), attendance takes `employee_email_id` (email). There is no single
    identifier addressing both, so `AuthzContext` has to carry an email→erecno mapping. Blocked on
    a real employee-form payload.
-2. **No Zoho People sandbox.** The real tool catalogue depends on the client org's actual modules,
-   leave types, attendance settings and custom forms.
+2. ~~**No Zoho People sandbox.**~~ **Resolved 2026-09-07.** Access exists; all three read endpoints
+   return 200 against the client's India tenant. What remains is data-shaped, not access-shaped —
+   see *Zoho People: pending* below.
+
+---
+
+## Zoho People: completed
+
+As of **`1be147f`**:
+
+- ✅ Employee endpoint confirmed, transformer implemented
+- ✅ Leave endpoint confirmed, transformer implemented
+- ✅ Employee forms response path confirmed as **`response.result`** (hardcoded default; env
+  override remains but is not required)
+- ✅ India DC confirmed — `people.zoho.in`
+- ✅ **Service-account OAuth model** selected for the POC
+- ✅ `data_select=ALL` confirmed working on leave
+- ✅ Employee and leave live client methods implemented
+- ✅ Seed and live tool contracts aligned, asserted by test
+- ✅ All backend, Zoho integration and frontend contract tests passing — **65 + 218 + 27 = 310**
+
+## Zoho People: pending
+
+1. **No live OAuth credentials in a local `.env`.** `ZOHO_CLIENT_ID`, `ZOHO_CLIENT_SECRET` and
+   `ZOHO_REFRESH_TOKEN` are unset, so `_shared/auth.service.js` has never minted a real token and
+   `accounts.zoho.in` is still marked `unverified` in `datacenters.js`.
+2. **No end-to-end validation.** The chain NeuIQ → backend → Zoho People → transformer → tool → AI
+   answer has never run once. Every layer is tested against fixtures; none has met a live response.
+3. **Attendance transformer.** Every response tested returned `data: []`, so no field name has been
+   observed. Refuses with **501** rather than returning an empty array — "no attendance" and "not
+   implemented" must not look alike. Also unknown: whether a row is one day or one
+   check-in/check-out pair, which decides the aggregation strategy, not just the mapping.
+4. **Employee name, location, designation and reporting fields** are absent from the captured
+   payload. Consequences: `employeeLookup` matches on email, `headcount` groups by department only.
+5. **Team hierarchy therefore stays disabled in live mode**, failing closed with a 403.
+6. **Is `recordId` the same identifier as leave's `employee_zoho_ids` (erecno)?** Unconfirmed, and
+   it is the join the whole identity chain rests on — leave addresses employees by erecno,
+   attendance by email.
+7. **Final leave and attendance OAuth scopes**, captured from a successful live request rather than
+   from documentation. Both are still `scope: null` and pending in `scopes.js`. Docs suggest
+   `ZOHOPEOPLE.leave.READ` and `ZOHOPEOPLE.attendance.ALL`; an earlier documented-pattern guess was
+   already wrong once, so neither is written in.
+8. **Production identity and authorization hardening** — `16-identity-authorization.md`, per-user
+   OAuth, and the `employee_zoho_ids` second fence.
+
+---
+
+## Next milestone: Live Zoho People End-to-End Validation
+
+Turn a built integration into a proven one. **No new features** — the goal is the first real answer
+produced from live Zoho data, and the defects that surface on the way.
+
+**Entry criteria:** OAuth credentials present in `backend/.env`.
+
+| # | Step | Proves |
+| --- | --- | --- |
+| 1 | Set the three `ZOHO_*` vars; start with `NEUIQ_DATA_SOURCE=seed` | Nothing breaks when credentials merely exist |
+| 2 | First real token mint | Refresh grant, DC host, single-flight. Flips `accounts.zoho.in` to confirmed |
+| 3 | Switch to `NEUIQ_DATA_SOURCE=zoho`, hit `GET /health` | Boot-time selection and manifest wiring |
+| 4 | `POST /query` on `leave` as an employee, then as an admin | Read-time scoping against live rows — the figures must differ |
+| 5 | `POST /chat` "how much casual leave do I have left?" | The full chain, with `say()` writing the sentence |
+| 6 | Capture the authorising scopes | Closes pending items 7 |
+| 7 | Compare a `recordId` against a leave row's `employee.zoho_id` | Closes item 6 — the identity join |
+| 8 | Widen the attendance range until one row returns | Unblocks item 3 |
+
+**Expected to break, and worth knowing in advance:**
+
+- **`approval_status` casing.** Live values may be `APPROVED` where the seed uses `Approved`.
+  Values are passed through untranslated by design, so leave-by-status will group differently.
+  Recorded as `LEAVE_GAPS.statusValues`.
+- **`departmentId` on leave.** Declared groupable in `sources.js`, absent from the payload, so
+  leave-by-department collapses to `—` until rows are enriched from the employee record.
+- **Row volume.** The six-month leave window is unpaginated today; `offset`/`limit` are documented
+  and untried.
+- **Catalyst function timeout** once several widgets resolve against a live API.
+
+**Exit criteria:** a real question answered from live Zoho data, with the employee/admin figures
+demonstrably different, and every gap above either closed or recorded.
 
 ---
 
 ## Known technical debt
 
 - Identity is a demo stub: no password check, no revocation, no refresh.
-- No Zoho client, no OAuth token provider, no rate limiting, no caching, no retry/backoff — all
-  designed (docs 05–08), none implemented.
+- Rate limiting is not implemented (doc 07). Retry/backoff, caching and the Zoho client now exist.
+- **Two tool implementations** — seed (sync) and live (async). Real duplication, accepted so the 65
+  backend assertions stayed untouched. Flagged in `tools/live.js` for a later convergence.
 - Per-widget caching and batched resolution with timeouts (specified in `15-dashboards.md`) are
   not implemented. On Catalyst the batching is mandatory, not nice, because of the function timeout.
 - `platform/store.js`: whole-file rewrite per mutation, O(n) scan per query, no concurrent writers.
@@ -708,15 +847,14 @@ Neither is a coding task, and neither can be worked around.
 
 ## Pending work, in priority order
 
-1. **Write `docs/backend/16-identity-authorization.md`** — blocks everything below it that touches
-   real data.
-2. **Get Zoho People sandbox access**; confirm the data-centre (`.in` vs `.com`) and the employee
-   identifier each endpoint expects; finalise the real tool catalogue.
-3. **Replace the demo identity stub** with the design from step 1.
-4. **Build the real Zoho People client + OAuth token provider** (docs 05, 06) behind the existing
-   tool interface.
-5. **Reliability layer:** cache, rate limiting, retry/backoff, per-widget caching keyed on the
-   caller, batched widget resolution (docs 07, 08, 15).
+1. **Live Zoho People End-to-End Validation** — the next milestone, above. Needs credentials, not
+   code. Everything below is easier to judge once one real answer has been produced.
+2. **Attendance transformer**, once a non-empty payload exists. Same shape as leave.
+3. **Write `docs/backend/16-identity-authorization.md`** — the OAuth-model half is settled; the
+   identity mapping and authorization layer are not. Blocks anything shipping against real data.
+4. **Replace the demo identity stub** with the design from step 3.
+5. **Reliability:** rate limiting (doc 07), per-widget caching keyed on the caller, batched widget
+   resolution with per-widget timeouts (doc 15). Retry/backoff and the request cache now exist.
 6. **Deploy to Catalyst**: `catalyst init`, swap `platform/store.js` for Data Store, work the
    deployment checklist.
 7. Fix the vite / plugin-react peer conflict.
