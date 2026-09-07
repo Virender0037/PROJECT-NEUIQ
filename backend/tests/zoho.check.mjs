@@ -41,6 +41,10 @@ import {
 import {
   createTokenProvider, configFromEnv, describeConfig, isConfigured,
 } from '../functions/neuiq_api/src/integrations/zoho/_shared/auth.service.js';
+import {
+  transformLeaveRecord, transformLeaveRecords, transformDayBreakdown,
+  CONFIRMED_LEAVE_FIELDS, LEAVE_GAPS,
+} from '../functions/neuiq_api/src/integrations/zoho/people/transformers/leave.js';
 
 let n = 0;
 const ok = (fn, what) => { fn(); n++; console.log('ok  ', what); };
@@ -442,5 +446,186 @@ ok(() => {
   assert.equal(s.clientSecret, 'set');
   assert.equal(JSON.stringify(s).includes('secret'), false);
 }, 'oauth: status() is safe to expose on /health');
+
+// ---------------------------------------------------------------- leave transformer
+//
+// The fixture below uses ONLY fields confirmed in a real non-empty response on 2026-09-07.
+// Nothing invented, and the extra keys in one case exist to prove they get dropped.
+
+/** One leave record, shaped exactly like the confirmed payload. */
+const RAW_LEAVE = {
+  leave_id: '55500000012345',
+  unit: 'Days',
+  from_date: '02-Sep-2026',
+  to_date: '03-Sep-2026',
+  date_of_request: '28-Aug-2026',
+  approval_status: 'Approved',
+  leave_type: { name: 'Casual Leave', id: '55500000000111', type: 'Paid' },
+  employee: {
+    zoho_id: '55500000000999',
+    name: 'Alex Mathew',
+    avatar: 'https://contacts.zoho.in/file?ID=abc&fs=thumb',
+    id: 'E1001',
+  },
+  days: {
+    '02-Sep-2026': { leave_count: '1.0', session: 'Full Day' },
+    '03-Sep-2026': { leave_count: '0.5', session: 'Session 1' },
+  },
+};
+
+ok(() => {
+  const r = transformLeaveRecord(RAW_LEAVE);
+  assert.equal(r.recordId, '55500000012345');
+}, 'leave: leave_id becomes the record identifier');
+ok(() => {
+  // The engine scopes on employeeId, and this must be zoho_id - the same identifier the
+  // endpoint's own employee_zoho_ids parameter takes.
+  assert.equal(transformLeaveRecord(RAW_LEAVE).employeeId, '55500000000999');
+}, 'leave: employee.zoho_id is the canonical employee identifier');
+ok(() => assert.equal(transformLeaveRecord(RAW_LEAVE).employeeAltId, 'E1001'), 'leave: employee.id preserved separately, not conflated');
+ok(() => assert.equal(transformLeaveRecord(RAW_LEAVE).employeeName, 'Alex Mathew'), 'leave: employee name mapped');
+
+ok(() => {
+  const r = transformLeaveRecord(RAW_LEAVE);
+  assert.equal(r.from, '2026-09-02');
+  assert.equal(r.to, '2026-09-03');
+  assert.equal(r.requestedOn, '2026-08-28');
+}, 'leave: all three dates convert dd-MMM-yyyy -> ISO');
+ok(() => assert.equal(transformLeaveRecord(RAW_LEAVE).month, '2026-09'), 'leave: month is the sortable key the engine groups on');
+
+ok(() => assert.equal(transformLeaveRecord(RAW_LEAVE).leaveType, 'Casual Leave'), 'leave: leave_type.name becomes leaveType');
+ok(() => assert.equal(transformLeaveRecord(RAW_LEAVE).leaveTypeId, '55500000000111'), 'leave: leave_type.id preserved');
+ok(() => assert.equal(transformLeaveRecord(RAW_LEAVE).leaveTypeCategory, 'Paid'), 'leave: leave_type.type preserved');
+ok(() => assert.equal(transformLeaveRecord(RAW_LEAVE).unit, 'Days'), 'leave: unit preserved');
+ok(() => assert.equal(transformLeaveRecord(RAW_LEAVE).status, 'Approved'), 'leave: approval_status becomes status');
+ok(() => {
+  // Values are carried verbatim. The field name was confirmed; its value domain was not, so a
+  // casing translation here would be an invented mapping table.
+  const upper = transformLeaveRecord({ ...RAW_LEAVE, approval_status: 'APPROVED' });
+  assert.equal(upper.status, 'APPROVED');
+}, 'leave: status values are passed through untranslated');
+
+ok(() => {
+  const r = transformLeaveRecord(RAW_LEAVE);
+  assert.equal(r.dayBreakdown.length, 2);
+  assert.deepEqual(r.dayBreakdown[0], {
+    date: '2026-09-02', sourceDate: '02-Sep-2026', leaveCount: 1, session: 'Full Day',
+  });
+}, 'leave: the dynamic days object becomes normalized dayBreakdown entries');
+ok(() => {
+  const r = transformLeaveRecord(RAW_LEAVE);
+  assert.equal(typeof r.dayBreakdown[0].leaveCount, 'number');
+  assert.equal(r.dayBreakdown[1].leaveCount, 0.5);
+}, 'leave: leave_count is converted to a number, half-days preserved');
+ok(() => {
+  // THE collision: Zoho's `days` is an object, ours is the number the engine aggregates.
+  const r = transformLeaveRecord(RAW_LEAVE);
+  assert.equal(typeof r.days, 'number');
+  assert.equal(r.days, 1.5);
+}, 'leave: `days` is the summed number the query engine can aggregate, not Zoho\'s object');
+ok(() => {
+  const r = transformLeaveRecord({
+    ...RAW_LEAVE,
+    days: { '03-Sep-2026': { leave_count: 1 }, '01-Sep-2026': { leave_count: 1 } },
+  });
+  assert.deepEqual(r.dayBreakdown.map((d) => d.date), ['2026-09-01', '2026-09-03']);
+}, 'leave: dayBreakdown is sorted into calendar order');
+ok(() => {
+  // An unparseable key must not lose the data - sourceDate still holds what Zoho sent.
+  const r = transformLeaveRecord({ ...RAW_LEAVE, days: { 'weird-key': { leave_count: 2 } } });
+  assert.equal(r.dayBreakdown[0].date, null);
+  assert.equal(r.dayBreakdown[0].sourceDate, 'weird-key');
+  assert.equal(r.days, 2);
+}, 'leave: an unrecognised day key keeps its raw value rather than dropping the count');
+ok(() => {
+  const r = transformLeaveRecord({ ...RAW_LEAVE, days: { '02-Sep-2026': { leave_count: 'nonsense' } } });
+  assert.equal(r.days, 0);
+  assert.equal(Number.isNaN(r.days), false);
+}, 'leave: an unparseable leave_count contributes 0, never NaN');
+ok(() => assert.deepEqual(transformLeaveRecord({ ...RAW_LEAVE, days: undefined }).dayBreakdown, []), 'leave: a missing days object is empty, not a throw');
+ok(() => assert.equal(transformLeaveRecord({ ...RAW_LEAVE, days: undefined }).days, 0), 'leave: no day detail sums to 0');
+
+ok(() => {
+  // Requirement: the avatar must not reach the LLM or the query layer by default.
+  const r = transformLeaveRecord(RAW_LEAVE);
+  assert.equal('employeeAvatar' in r, false);
+  assert.equal(JSON.stringify(r).includes('contacts.zoho.in'), false);
+  assert.equal(JSON.stringify(r).includes('avatar'), false);
+}, 'leave: employee.avatar is NOT exposed by default');
+ok(() => {
+  const r = transformLeaveRecord(RAW_LEAVE, { includeAvatar: true });
+  assert.equal(r.employeeAvatar, 'https://contacts.zoho.in/file?ID=abc&fs=thumb');
+}, 'leave: the avatar is available only on explicit opt-in');
+
+ok(() => {
+  // An allow-list, not a rename pass. The employee form was already returning Date_of_birth and
+  // Gender; a deny-list would carry the next such field straight into a prompt.
+  const r = transformLeaveRecord({
+    ...RAW_LEAVE,
+    Date_of_birth: '01-Jan-1990',
+    Gender: 'Male',
+    salary: 999999,
+    employee: { ...RAW_LEAVE.employee, personal_mobile: '+910000000000' },
+  });
+  const json = JSON.stringify(r);
+  for (const leaked of ['Date_of_birth', 'Gender', 'salary', '999999', 'personal_mobile', '+910000000000']) {
+    assert.equal(json.includes(leaked), false, leaked);
+  }
+}, 'leave: unknown fields are DROPPED, including nested ones');
+ok(() => {
+  const keys = Object.keys(transformLeaveRecord(RAW_LEAVE)).sort();
+  assert.deepEqual(keys, [
+    'dayBreakdown', 'days', 'employeeAltId', 'employeeId', 'employeeName',
+    'from', 'leaveType', 'leaveTypeCategory', 'leaveTypeId', 'month', 'recordId', 'requestedOn',
+    'status', 'to', 'unit',
+  ].sort());
+}, 'leave: the output shape is exactly the mapped fields, nothing more');
+
+ok(() => {
+  // A row with no identifier fails CLOSED: the scope filter compares undefined against the
+  // caller and does not match, so it is excluded from a scoped read rather than leaking into one.
+  const r = transformLeaveRecord({ ...RAW_LEAVE, employee: {} });
+  assert.equal(r.employeeId, null);
+  assert.notEqual(r.employeeId, '55500000000999');
+}, 'leave: a record with no employee id yields null, which fails closed under scoping');
+
+ok(() => assert.equal(transformLeaveRecord(null), null), 'leave: null input returns null');
+ok(() => assert.equal(transformLeaveRecord([]), null), 'leave: an array is not a record');
+ok(() => assert.equal(transformLeaveRecord({}).recordId, null), 'leave: an empty object yields nulls, not a throw');
+ok(() => assert.deepEqual(transformLeaveRecords([]), []), 'leave: an empty page is an empty array');
+ok(() => assert.deepEqual(transformLeaveRecords(null), []), 'leave: a non-array page is empty, not a throw');
+ok(() => assert.equal(transformLeaveRecords([RAW_LEAVE, null, 'x', RAW_LEAVE]).length, 2), 'leave: unusable entries are dropped from a page');
+
+ok(() => {
+  // End to end from the confirmed envelope, which is how this will actually be called.
+  const rows = transformLeaveRecords(unwrapV3({
+    data: [RAW_LEAVE], message: 'Record(s) fetched successfully.', status: 'success',
+  }).rows);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].days, 1.5);
+  assert.equal(rows[0].month, '2026-09');
+}, 'leave: unwrapV3 -> transform produces engine-ready rows');
+ok(() => {
+  const rows = transformLeaveRecords(unwrapV3({
+    data: [], message: 'Record(s) fetched successfully.', status: 'success',
+  }).rows);
+  assert.deepEqual(rows, []);
+}, 'leave: the validated empty response stays an empty success through the transformer');
+
+ok(() => {
+  // The gaps are recorded in code so they are not rediscovered as bugs. departmentId is declared
+  // groupable on `leave` in sources.js but does not exist in this payload.
+  const r = transformLeaveRecord(RAW_LEAVE);
+  assert.equal('departmentId' in r, false);
+  assert.ok(LEAVE_GAPS.departmentId.includes('department'));
+  assert.ok(LEAVE_GAPS.statusValues.includes('approval_status'));
+}, 'leave: the departmentId gap is absent from the row and recorded, not invented');
+ok(() => {
+  // A guard on the allow-list itself: if someone adds a field here, they have to say where the
+  // observation came from.
+  assert.equal(CONFIRMED_LEAVE_FIELDS.length, 15);
+  assert.ok(CONFIRMED_LEAVE_FIELDS.includes('employee.zoho_id'));
+  assert.equal(CONFIRMED_LEAVE_FIELDS.includes('department'), false);
+}, 'leave: the confirmed field list matches what was actually observed');
 
 console.log(`\nall ${n} zoho integration checks pass`);
