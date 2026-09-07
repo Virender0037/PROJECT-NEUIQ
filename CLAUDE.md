@@ -572,9 +572,21 @@ There is **no CI** — nothing runs `npm run check` automatically.
 
 ## Environment and secrets
 
-`.gitignore` blocks `.env` and `.env.*` (excepting `.env.example`), `.catalystrc`,
-`catalyst-cli.log`, `.catalyst/`, `node_modules`, `dist`. **Never commit Zoho or Gemini
-credentials, and never add a real secret to an `.env.example`.**
+`.gitignore` blocks:
+
+```gitignore
+node_modules
+dist, dist-ssr, *.local
+.env, .env.*          (excepting !.env.example)
+.catalystrc, catalyst-cli.log, .catalyst/
+catalyst.json         # carries the client's Catalyst project and org IDs
+backend/db/           # generated runtime store, regenerated on first run
+.DS_Store, .vscode/*, npm-debug.log*
+```
+
+**Never commit Zoho or Gemini credentials, and never add a real secret to an `.env.example`.**
+`backend/db/` and `catalyst.json` are ignored as *generated and client-specific*, not as secrets —
+but both would leak environment detail into the repository, so neither belongs in a commit.
 
 **Backend** (`backend/.env.example`) — every value optional, all defaulted:
 
