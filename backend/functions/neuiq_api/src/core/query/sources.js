@@ -28,10 +28,24 @@ import { isAdmin } from '../policy/roles.js';
  */
 export const SOURCES = {};
 
-/** Register a product's sources. Called once per integration by integrations/registry.js. */
+/**
+ * Register a product's sources. Called once per integration by integrations/registry.js.
+ *
+ * A source must be either admin-only or scopeable. A source that is neither — no `scope` function
+ * and no `adminOnly` flag — is read in full by every caller, because there is nothing for
+ * core/policy/scope.js to pin it with and nothing to refuse it either. That is the one
+ * misconfiguration in this design that silently grants everyone everything, so it is refused at
+ * registration rather than discovered in production.
+ */
 export function registerSources(defs) {
   for (const [key, def] of Object.entries(defs || {})) {
     if (SOURCES[key]) throw new Error(`query: source "${key}" is already registered`);
+    if (typeof def?.scope !== 'function' && !def?.adminOnly) {
+      throw new Error(
+        `query: source "${key}" has no scope function and is not adminOnly — every caller would `
+        + 'read all of it. Give it a scope(employeeId), or mark it adminOnly.',
+      );
+    }
     SOURCES[key] = def;
   }
 }

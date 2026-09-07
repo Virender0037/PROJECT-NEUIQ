@@ -45,6 +45,32 @@ import {
   transformLeaveRecord, transformLeaveRecords, transformDayBreakdown,
   CONFIRMED_LEAVE_FIELDS, LEAVE_GAPS,
 } from '../functions/neuiq_api/src/integrations/zoho/people/transformers/leave.js';
+import {
+  endpoint, dataSelectFor, LEAVE_DATA_SELECT, DOCUMENTED_UNTRIED, CONFIRMED_ENDPOINTS,
+} from '../functions/neuiq_api/src/integrations/zoho/people/endpoints.js';
+import { createCache, cacheKey } from '../functions/neuiq_api/src/core/platform/cache.js';
+import { createZohoClient } from '../functions/neuiq_api/src/integrations/zoho/_shared/client.js';
+import {
+  transformEmployeeRecord, transformEmployeeRecords, buildEmailIndex,
+  EMPLOYEE_GAPS, ALLOWED_EMPLOYEE_FIELDS, DROPPED_PII_FIELDS,
+} from '../functions/neuiq_api/src/integrations/zoho/people/transformers/employee.js';
+import {
+  transformAttendanceRecord, transformAttendanceRecords,
+  ATTENDANCE_TRANSFORMER_READY, ATTENDANCE_TODO,
+} from '../functions/neuiq_api/src/integrations/zoho/people/transformers/attendance.js';
+import { buildLiveSources } from '../functions/neuiq_api/src/integrations/zoho/people/sources.live.js';
+import { buildLiveTools } from '../functions/neuiq_api/src/integrations/zoho/people/tools/live.js';
+import { buildPeopleManifest } from '../functions/neuiq_api/src/integrations/zoho/people/manifest.js';
+import { PEOPLE_TOOLS } from '../functions/neuiq_api/src/integrations/zoho/people/tools/index.js';
+import { runQuery, runQueryAsync } from '../functions/neuiq_api/src/core/query/engine.js';
+import { SOURCES, registerSources } from '../functions/neuiq_api/src/core/query/sources.js';
+
+// The seed registry must be populated before the engine assertions below run.
+import '../functions/neuiq_api/src/integrations/registry.js';
+
+const EMPLOYEE = { employeeId: 'E1001', username: 'alex', role: 'employee' };
+const ADMIN = { employeeId: 'E1004', username: 'meera', role: 'hr_admin' };
+const MANAGER_LIVE = { employeeId: 'E1003', username: 'rohit', role: 'manager' };
 
 let n = 0;
 const ok = (fn, what) => { fn(); n++; console.log('ok  ', what); };
@@ -187,10 +213,11 @@ ok(() => {
 ok(() => assert.equal(flattenKeyedRecords({}).empty, true), 'envelope: no forms records is an empty success');
 throws(() => flattenKeyedRecords([]), 'envelope: an array where a keyed object belongs is refused');
 throws(() => flattenKeyedRecords(null), 'envelope: null is refused');
-ok(() => assert.equal(FORMS_RESULT_PATH, null), 'envelope: the forms wrapper path is still unconfirmed');
-throws(() => unwrapForms({ anything: true }), 'envelope: unwrapForms REFUSES while the path is unconfirmed');
+// The wrapper path was unconfirmed through Phase 2 and unwrapForms refused. It was confirmed on
+// 2026-09-07, so these now assert the resolved behaviour instead of the blocker.
+throws(() => unwrapForms({ anything: true }), 'envelope: a body without the result node still throws');
 ok(() => {
-  // Once the path is supplied it works, so confirming it is a one-line change and not a rewrite.
+  // An explicit path still overrides, which is what the env variable drives.
   const body = { response: { result: [{ '390': { EmailID: 'a@b.c' } }] } };
   const r = unwrapForms(body, ['response', 'result']);
   assert.equal(r.rows.length, 1);
@@ -627,5 +654,576 @@ ok(() => {
   assert.ok(CONFIRMED_LEAVE_FIELDS.includes('employee.zoho_id'));
   assert.equal(CONFIRMED_LEAVE_FIELDS.includes('department'), false);
 }, 'leave: the confirmed field list matches what was actually observed');
+
+// ---------------------------------------------------------------- endpoints ledger
+ok(() => assert.equal(endpoint('people.leave.list').path, '/people/api/v3/leave-tracker/leaves'), 'endpoints: confirmed leave path');
+ok(() => assert.equal(endpoint('people.attendance.entries').path, '/people/api/v3/attendance/entries'), 'endpoints: confirmed attendance path');
+ok(() => assert.equal(endpoint('people.employee.records').envelope, 'forms'), 'endpoints: employee uses the forms envelope');
+ok(() => assert.equal(endpoint('people.leave.list').envelope, 'v3'), 'endpoints: leave uses the v3 envelope');
+throws(() => endpoint('people.timesheets'), 'endpoints: an unrecorded endpoint throws rather than guessing a path');
+
+ok(() => assert.ok(LEAVE_DATA_SELECT.confirmed.includes('ALL')), 'endpoints: data_select=ALL is recorded as confirmed');
+ok(() => assert.ok(LEAVE_DATA_SELECT.confirmed.includes('MINE')), 'endpoints: data_select=MINE remains confirmed');
+ok(() => {
+  // Documented-but-untried values must not have leaked into the confirmed list.
+  for (const v of LEAVE_DATA_SELECT.documented) {
+    assert.equal(LEAVE_DATA_SELECT.confirmed.includes(v), false, v);
+  }
+}, 'endpoints: untried data_select values stay out of the confirmed list');
+ok(() => {
+  // employee_zoho_ids is documented only. Sending it now would be an untested assumption, and
+  // confirming it is security work - it is the second fence behind our read-time filter.
+  assert.ok(DOCUMENTED_UNTRIED['people.leave.list'].includes('employee_zoho_ids'));
+  assert.equal(endpoint('people.leave.list').confirmedParams.includes('employee_zoho_ids'), false);
+}, 'endpoints: employee_zoho_ids is documented, not confirmed, and is not sent');
+
+ok(() => {
+  // ALL for every role is the deliberate consequence of the service-account model: MINE would
+  // resolve to the service identity, not the caller.
+  const roles = [{ role: 'employee' }, { role: 'manager' }, { role: 'hr_admin' }];
+  for (const u of roles) assert.equal(dataSelectFor(u), 'ALL', u.role);
+}, 'endpoints: every role sends data_select=ALL under the service-account model');
+ok(() => {
+  // Whatever dataSelectFor returns must be something we have actually seen work.
+  assert.ok(LEAVE_DATA_SELECT.confirmed.includes(dataSelectFor({ role: 'employee' })));
+}, 'endpoints: dataSelectFor only ever returns a confirmed value');
+
+ok(() => {
+  // The two v3 endpoints identify employees differently. This is the mapping problem AuthzContext
+  // has to solve, recorded as a test so it is not rediscovered when the client is written.
+  assert.ok(endpoint('people.attendance.entries').confirmedParams.includes('employee_email_id'));
+  assert.equal(endpoint('people.leave.list').confirmedParams.includes('employee_email_id'), false);
+}, 'endpoints: leave and attendance take DIFFERENT employee identifiers');
+
+ok(() => {
+  // The endpoint ledger points at scope keys; those are still pending in scopes.js and must not
+  // have been quietly promoted by this change.
+  assert.equal(isConfirmedScope(endpoint('people.employee.records').scopeKey), true);
+  assert.equal(isConfirmedScope(endpoint('people.leave.list').scopeKey), false);
+  assert.equal(isConfirmedScope(endpoint('people.attendance.entries').scopeKey), false);
+}, 'endpoints: confirming data_select did NOT promote the pending v3 scopes');
+
+// ---------------------------------------------------------------- cache
+ok(() => {
+  // THE cache rule: a key without a caller is a data leak wearing a cache's clothes.
+  assert.throws(() => cacheKey(null, 'leave'));
+  assert.throws(() => cacheKey('', 'leave'));
+}, 'cache: a key cannot be built without a caller');
+ok(() => assert.notEqual(cacheKey('E1001', 'leave'), cacheKey('E1004', 'leave')), 'cache: two callers never share a key');
+ok(() => {
+  // Key order in a spec object must not change the key, or the cache silently misses.
+  assert.equal(cacheKey('E1', { a: 1, b: 2 }), cacheKey('E1', { b: 2, a: 1 }));
+}, 'cache: object key order does not change the key');
+await (async () => {
+  let t = 1000;
+  const c = createCache({ now: () => t });
+  let loads = 0;
+  const load = async () => { loads++; return 'v'; };
+  assert.equal(await c.wrap('k', 60, load), 'v');
+  assert.equal(await c.wrap('k', 60, load), 'v');
+  assert.equal(loads, 1);
+  t += 61_000;
+  assert.equal(await c.wrap('k', 60, load), 'v');
+  assert.equal(loads, 2);
+  n++; console.log('ok   cache: entries are reused until the TTL expires');
+})();
+await (async () => {
+  const c = createCache();
+  await assert.rejects(() => c.wrap('k', 60, async () => { throw new Error('boom'); }));
+  assert.equal(c.get('k'), undefined);
+  n++; console.log('ok   cache: a rejected loader is never cached');
+})();
+
+// ---------------------------------------------------------------- zoho http client
+const okRes = (body) => ({ ok: true, status: 200, headers: new Map(), json: async () => body });
+const errRes = (status, body = {}, headers = new Map()) =>
+  ({ ok: false, status, headers, json: async () => body });
+const stubProvider = () => {
+  let invalidated = 0;
+  return {
+    getAccessToken: async () => 'tok',
+    invalidate: () => { invalidated++; },
+    invalidations: () => invalidated,
+  };
+};
+const quietLogger = { log() {}, warn() {} };
+
+await (async () => {
+  let capturedUrl = null; let capturedInit = null;
+  const c = createZohoClient({
+    product: 'people', dc: 'in', tokenProvider: stubProvider(), logger: quietLogger,
+    fetchImpl: async (url, init) => { capturedUrl = url; capturedInit = init; return okRes({ ok: 1 }); },
+  });
+  await c.get('/people/api/v3/leave-tracker/leaves', { params: { from_date: '01-Sep-2026' } });
+  assert.ok(capturedUrl.startsWith('https://people.zoho.in/'));
+  assert.ok(capturedUrl.includes('from_date=01-Sep-2026'));
+  assert.equal(capturedInit.headers.authorization, 'Zoho-oauthtoken tok');
+  n++; console.log('ok   client: hits the confirmed India host with Zoho-oauthtoken auth');
+})();
+
+await (async () => {
+  // A 401 buys one refresh and one retry. A second 401 is a real credential problem.
+  const provider = stubProvider();
+  let calls = 0;
+  const c = createZohoClient({
+    product: 'people', dc: 'in', tokenProvider: provider, logger: quietLogger,
+    fetchImpl: async () => { calls++; return calls === 1 ? errRes(401) : okRes({ ok: 1 }); },
+  });
+  assert.deepEqual(await c.get('/x'), { ok: 1 });
+  assert.equal(calls, 2);
+  assert.equal(provider.invalidations(), 1);
+  n++; console.log('ok   client: a 401 refreshes the token once and retries once');
+})();
+
+await (async () => {
+  let calls = 0;
+  const c = createZohoClient({
+    product: 'people', dc: 'in', tokenProvider: stubProvider(), logger: quietLogger,
+    fetchImpl: async () => { calls++; return errRes(401); },
+  });
+  await assert.rejects(() => c.get('/x'));
+  assert.equal(calls, 2);
+  n++; console.log('ok   client: a second 401 gives up rather than looping');
+})();
+
+await (async () => {
+  // THE rule: a refusal repeated is still a refusal. Retrying burns quota and changes nothing.
+  let calls = 0;
+  const c = createZohoClient({
+    product: 'people', dc: 'in', tokenProvider: stubProvider(), logger: quietLogger,
+    fetchImpl: async () => { calls++; return errRes(403); },
+  });
+  await assert.rejects(() => c.get('/x'), (e) => e.status === 403);
+  assert.equal(calls, 1);
+  n++; console.log('ok   client: a 403 is NEVER retried and stays a 403');
+})();
+
+await (async () => {
+  const waits = [];
+  let calls = 0;
+  const c = createZohoClient({
+    product: 'people', dc: 'in', tokenProvider: stubProvider(), logger: quietLogger,
+    sleepImpl: async (ms) => { waits.push(ms); },
+    fetchImpl: async () => { calls++; return calls < 3 ? errRes(500) : okRes({ ok: 1 }); },
+  });
+  assert.deepEqual(await c.get('/x'), { ok: 1 });
+  assert.equal(calls, 3);
+  assert.deepEqual(waits, [300, 600]);
+  n++; console.log('ok   client: 5xx retries with exponential backoff');
+})();
+
+await (async () => {
+  const waits = [];
+  let calls = 0;
+  const c = createZohoClient({
+    product: 'people', dc: 'in', tokenProvider: stubProvider(), logger: quietLogger,
+    sleepImpl: async (ms) => { waits.push(ms); },
+    fetchImpl: async () => { calls++; return calls === 1 ? errRes(429, {}, new Map([['retry-after', '2']])) : okRes({ ok: 1 }); },
+  });
+  await c.get('/x');
+  assert.deepEqual(waits, [2000]);
+  n++; console.log('ok   client: Retry-After is honoured rather than guessed');
+})();
+
+await (async () => {
+  // A hostile or mistaken Retry-After must not park a request for an hour.
+  const waits = [];
+  let calls = 0;
+  const c = createZohoClient({
+    product: 'people', dc: 'in', tokenProvider: stubProvider(), logger: quietLogger,
+    sleepImpl: async (ms) => { waits.push(ms); },
+    fetchImpl: async () => { calls++; return calls === 1 ? errRes(429, {}, new Map([['retry-after', '99999']])) : okRes({ ok: 1 }); },
+  });
+  await c.get('/x');
+  assert.equal(waits[0], 10_000);
+  n++; console.log('ok   client: an absurd Retry-After is capped');
+})();
+
+await (async () => {
+  // An error body can carry the token that just failed.
+  const lines = [];
+  const c = createZohoClient({
+    product: 'people', dc: 'in', tokenProvider: stubProvider(),
+    logger: { log() {}, warn: (l) => lines.push(l) },
+    fetchImpl: async () => errRes(400, { message: 'bad', access_token: 'SECRET_TOKEN' }),
+  });
+  await assert.rejects(() => c.get('/x'));
+  assert.equal(lines.join('').includes('SECRET_TOKEN'), false);
+  assert.ok(lines.join('').includes('[redacted]'));
+  n++; console.log('ok   client: a token in an error body is redacted before it is logged');
+})();
+
+// ---------------------------------------------------------------- employee transformer
+/**
+ * The real employee response, exactly as captured on 2026-09-07:
+ *
+ *   response.result -> [ { "<record_id>": [ { EmailID, "Employee_type.id", Department, ... } ] } ]
+ *
+ * Note `Employee_type.id` is a FLAT key containing a dot, not a nested object.
+ */
+const LIVE_EMPLOYEE_BODY = {
+  response: {
+    result: [
+      {
+        '55500000000999': [{
+          EmailID: 'Alex.Mathew@fristinetech.com',
+          'Employee_type.id': '4200000000021',
+          Department: 'Engineering',
+          Date_of_birth: '01-Jan-1990',
+          Gender: 'Male',
+          Photo: 'https://contacts.zoho.in/file?ID=xyz',
+        }],
+      },
+      {
+        '55500000001000': [{
+          EmailID: 'Priya.Nair@fristinetech.com',
+          'Employee_type.id': '4200000000021',
+          Department: 'Engineering',
+          Date_of_birth: '02-Feb-1992',
+          Gender: 'Female',
+        }],
+      },
+      {
+        '55500000001001': [{
+          EmailID: 'Meera.Iyer@fristinetech.com',
+          'Employee_type.id': '4200000000022',
+          Department: 'People',
+          Gender: 'Female',
+        }],
+      },
+    ],
+  },
+};
+
+/** One flattened record, as unwrapForms hands it to the transformer. */
+const RAW_EMPLOYEE = {
+  __recordId: '55500000000999',
+  EmailID: 'Alex.Mathew@fristinetech.com',
+  'Employee_type.id': '4200000000021',
+  Department: 'Engineering',
+  Date_of_birth: '01-Jan-1990',
+  Gender: 'Male',
+  Photo: 'https://contacts.zoho.in/file?ID=xyz',
+};
+
+ok(() => {
+  // The confirmed path, working with no configuration required.
+  assert.deepEqual(FORMS_RESULT_PATH, ['response', 'result']);
+}, 'forms: the confirmed result path is response.result, no env needed');
+ok(() => {
+  const r = unwrapForms(LIVE_EMPLOYEE_BODY);
+  assert.equal(r.rows.length, 3);
+  assert.equal(r.rows[0].__recordId, '55500000000999');
+  assert.equal(r.rows[0].EmailID, 'Alex.Mathew@fristinetech.com');
+}, 'forms: the real payload unwraps to one row per record');
+ok(() => {
+  // result holds an ARRAY of keyed objects. Assuming length 1 would return one employee of fifty.
+  const ids = unwrapForms(LIVE_EMPLOYEE_BODY).rows.map((r) => r.__recordId);
+  assert.deepEqual(ids, ['55500000000999', '55500000001000', '55500000001001']);
+}, 'forms: EVERY element of the result array is flattened, not just the first');
+ok(() => assert.equal(unwrapForms({ response: { result: [] } }).empty, true), 'forms: an empty result array is a successful empty read');
+throws(() => unwrapForms({ response: {} }), 'forms: a missing result node throws rather than reading as empty');
+
+ok(() => {
+  const r = transformEmployeeRecord(RAW_EMPLOYEE);
+  assert.equal(r.recordId, '55500000000999');
+  assert.equal(r.email, 'Alex.Mathew@fristinetech.com');
+  assert.equal(r.department, 'Engineering');
+  assert.equal(r.employmentTypeId, '4200000000021');
+}, 'employee: the confirmed fields map');
+ok(() => {
+  // The concrete reason this layer is an allow-list: both of these were in the first real payload.
+  const json = JSON.stringify(transformEmployeeRecord(RAW_EMPLOYEE));
+  for (const pii of ['Date_of_birth', '1990', 'Gender', 'Male']) {
+    assert.equal(json.includes(pii), false, pii);
+  }
+}, 'employee: Date_of_birth and Gender are DROPPED, never emitted');
+ok(() => {
+  const json = JSON.stringify(transformEmployeeRecord({
+    ...RAW_EMPLOYEE, Salary: 900000, PAN: 'ABCDE1234F', Personal_Mobile: '+910000000000',
+  }));
+  for (const leaked of ['Salary', '900000', 'PAN', 'ABCDE1234F', 'Personal_Mobile']) {
+    assert.equal(json.includes(leaked), false, leaked);
+  }
+}, 'employee: unknown fields are dropped, including obvious PII');
+ok(() => {
+  assert.deepEqual(Object.keys(transformEmployeeRecord(RAW_EMPLOYEE)).sort(),
+    ['department', 'email', 'employmentTypeId', 'recordId']);
+}, 'employee: the output shape is exactly the four mapped fields');
+ok(() => {
+  const idx = buildEmailIndex([RAW_EMPLOYEE]);
+  assert.equal(idx.get('alex.mathew@fristinetech.com'), '55500000000999');
+}, 'employee: the email index is lower-cased, so casing cannot break one person\'s lookup');
+ok(() => assert.equal(buildEmailIndex([{ EmailID: 'x@y.z' }]).size, 0), 'employee: a record missing an id is left out of the index, not half-added');
+ok(() => assert.equal(transformEmployeeRecord(null), null), 'employee: null input returns null');
+ok(() => assert.ok(EMPLOYEE_GAPS.orgFields.includes('manager')), 'employee: the missing manager field is recorded, blocking team scope on live data');
+ok(() => {
+  // Employee_type.id is a FLAT dotted key. Reading it as a nested object would leave the whole
+  // column silently empty - nothing would fail, the data would just be gone.
+  assert.equal(transformEmployeeRecord(RAW_EMPLOYEE).employmentTypeId, '4200000000021');
+  assert.equal(transformEmployeeRecord({ 'Employee_type.id': 7 }).employmentTypeId, '7');
+}, 'employee: the flat "Employee_type.id" key is read correctly');
+ok(() => {
+  const json = JSON.stringify(transformEmployeeRecord(RAW_EMPLOYEE));
+  assert.equal(json.includes('Photo'), false);
+  assert.equal(json.includes('contacts.zoho.in'), false);
+}, 'employee: Photo is dropped, like leave\'s avatar');
+ok(() => {
+  // End to end from the real body.
+  const rows = transformEmployeeRecords(unwrapForms(LIVE_EMPLOYEE_BODY).rows);
+  assert.equal(rows.length, 3);
+  assert.deepEqual(rows[0], {
+    recordId: '55500000000999',
+    email: 'Alex.Mathew@fristinetech.com',
+    department: 'Engineering',
+    employmentTypeId: '4200000000021',
+  });
+}, 'employee: real body -> unwrap -> transform yields the normalized shape');
+ok(() => {
+  // No PII survives the full pipeline, across every record.
+  const json = JSON.stringify(transformEmployeeRecords(unwrapForms(LIVE_EMPLOYEE_BODY).rows));
+  for (const pii of ['Date_of_birth', '1990', '1992', 'Gender', 'Male', 'Female', 'Photo', 'contacts.zoho.in']) {
+    assert.equal(json.includes(pii), false, pii);
+  }
+}, 'employee: no PII survives the full real-payload pipeline');
+ok(() => {
+  const idx = buildEmailIndex(unwrapForms(LIVE_EMPLOYEE_BODY).rows);
+  assert.equal(idx.size, 3);
+  assert.equal(idx.get('meera.iyer@fristinetech.com'), '55500000001001');
+}, 'employee: the email index builds from the real payload');
+
+// ---------------------------------------------------------------- attendance: pending
+ok(() => assert.equal(ATTENDANCE_TRANSFORMER_READY, false), 'attendance: the transformer reports itself as not ready');
+throws(() => transformAttendanceRecord({ anything: 1 }), 'attendance: transforming a record REFUSES rather than guessing fields');
+ok(() => assert.deepEqual(transformAttendanceRecords([]), []), 'attendance: an empty page is allowed through — that needs no field mapping');
+throws(() => transformAttendanceRecords([{ a: 1 }]), 'attendance: a NON-empty page refuses, because mapping it is what does not exist');
+ok(() => {
+  try { transformAttendanceRecord({}); } catch (e) {
+    assert.equal(e.status, 501);
+    assert.equal(e.pending, true);
+    // 501 not 500: a capability that does not exist yet is not a fault.
+    assert.ok(e.message.includes('Do not guess'));
+  }
+}, 'attendance: the refusal is a 501 with an actionable message');
+ok(() => assert.ok(ATTENDANCE_TODO.granularity.includes('check-in')), 'attendance: the day-vs-punch question is recorded');
+ok(() => assert.ok(ATTENDANCE_TODO.volume.includes('8,600')), 'attendance: the row-volume concern is recorded');
+
+// ---------------------------------------------------------------- live sources
+const stubClient = (rows = []) => ({
+  leaves: async () => rows,
+  employees: async () => [],
+  attendanceEntries: async () => [],
+});
+
+await (async () => {
+  const live = buildLiveSources({ client: stubClient([RAW_LEAVE]) });
+  // Same contract as the seed source: a dashboard saved against one must resolve against the other.
+  for (const key of ['leave', 'attendance', 'employees']) {
+    assert.deepEqual(live[key].group, SOURCES[key].group, key);
+    assert.deepEqual(live[key].numeric, SOURCES[key].numeric, key);
+  }
+  assert.equal(live.employees.adminOnly, true);
+  assert.equal(live.employees.scope, null);
+  n++; console.log('ok   live sources: identical contract to the seed sources');
+})();
+
+await (async () => {
+  const live = buildLiveSources({ client: stubClient([RAW_LEAVE]) });
+  const rows = await live.leave.fetchRows({ user: { employeeId: '55500000000999' } });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].days, 1.5);
+  n++; console.log('ok   live sources: leave fetches and transforms into engine-ready rows');
+})();
+
+await (async () => {
+  const live = buildLiveSources({ client: stubClient([]) });
+  await assert.rejects(() => live.attendance.fetchRows({ user: { employeeId: 'E1' } }), (e) => e.pending === true);
+  n++; console.log('ok   live sources: attendance refuses rather than reporting zero hours');
+})();
+
+// ---------------------------------------------------------------- live tools
+await (async () => {
+  const live = buildLiveTools({ client: stubClient([RAW_LEAVE]) });
+  // The contract must not drift between the two implementations.
+  assert.deepEqual(Object.keys(live).sort(), Object.keys(PEOPLE_TOOLS).sort());
+  for (const [name, tool] of Object.entries(live)) {
+    assert.equal(tool.scope, PEOPLE_TOOLS[name].scope, name);
+    assert.deepEqual(Object.keys(tool.params), Object.keys(PEOPLE_TOOLS[name].params), name);
+    assert.equal(tool.label, PEOPLE_TOOLS[name].label, name);
+    assert.equal(tool.say, PEOPLE_TOOLS[name].say, name);
+  }
+  n++; console.log('ok   live tools: same names, scopes, params and say() as the seed tools');
+})();
+
+await (async () => {
+  const live = buildLiveTools({ client: stubClient([RAW_LEAVE]) });
+  const caller = { employeeId: '55500000000999', role: 'employee' };
+  const d = await live['zohoPeople.leaveRecords'].run({}, caller);
+  assert.equal(d.employeeId, '55500000000999');
+  // say() still writes the sentence - the anti-hallucination guarantee is unchanged by the data
+  // arriving over a network.
+  assert.ok(/leave record/.test(PEOPLE_TOOLS['zohoPeople.leaveRecords'].say(d)));
+  n++; console.log('ok   live tools: a live tool result is still narrated by say()');
+})();
+
+await (async () => {
+  // Authorization sits below routing for the live tools too.
+  const live = buildLiveTools({ client: stubClient([RAW_LEAVE]) });
+  await assert.rejects(
+    () => live['zohoPeople.leaveRecords'].run({ employeeId: 'SOMEONE_ELSE' }, { employeeId: 'E1', role: 'employee' }),
+    (e) => e.status === 403,
+  );
+  n++; console.log('ok   live tools: an employee still cannot read a colleague (403)');
+})();
+
+await (async () => {
+  const live = buildLiveTools({ client: stubClient([]) });
+  await assert.rejects(
+    () => live['zohoPeople.attendanceSummary'].run({}, { employeeId: 'E1', role: 'employee' }),
+    (e) => e.pending === true,
+  );
+  n++; console.log('ok   live tools: attendance refuses while its transformer is pending');
+})();
+
+// ---- headcount and employeeLookup against live-shaped fixture data ----
+const liveEmployeeClient = () => ({
+  leaves: async () => [],
+  employees: async () => unwrapForms(LIVE_EMPLOYEE_BODY).rows,
+  attendanceEntries: async () => [],
+});
+
+await (async () => {
+  const live = buildLiveTools({ client: liveEmployeeClient() });
+  const d = await live['zohoPeople.headcount'].run({ groupBy: 'department' }, ADMIN);
+  assert.equal(d.total, 3);
+  assert.deepEqual(d.groups, [{ name: 'Engineering', value: 2 }, { name: 'People', value: 1 }]);
+  assert.equal(d.groupBy, 'department');
+  assert.equal(d.downgraded, false);
+  // say() still writes the sentence.
+  assert.ok(/3 employees by department/.test(PEOPLE_TOOLS['zohoPeople.headcount'].say(d)));
+  n++; console.log('ok   live tools: headcount works against the real employee payload');
+})();
+
+await (async () => {
+  // location and designation do not exist on a live employee record. Grouping by either would
+  // report one bar labelled "undefined" - a chart that looks like an answer and is not one.
+  const live = buildLiveTools({ client: liveEmployeeClient() });
+  const d = await live['zohoPeople.headcount'].run({ groupBy: 'location' }, ADMIN);
+  assert.equal(d.groupBy, 'department');
+  assert.equal(d.requestedGroupBy, 'location');
+  assert.equal(d.downgraded, true);
+  assert.equal(d.groups.some((g) => g.name === undefined || g.name === 'undefined'), false);
+  n++; console.log('ok   live tools: headcount downgrades an unavailable groupBy instead of charting undefined');
+})();
+
+await (async () => {
+  const live = buildLiveTools({ client: liveEmployeeClient() });
+  const d = await live['zohoPeople.employeeLookup'].run({ name: 'meera' }, MANAGER_LIVE);
+  assert.equal(d.count, 1);
+  assert.equal(d.employees[0].employeeId, '55500000001001');
+  assert.equal(d.employees[0].department, 'People');
+  assert.equal(d.matchedOn, 'email');
+  assert.ok(PEOPLE_TOOLS['zohoPeople.employeeLookup'].say(d).includes('People'));
+  n++; console.log('ok   live tools: employeeLookup works against the real employee payload');
+})();
+
+await (async () => {
+  const live = buildLiveTools({ client: liveEmployeeClient() });
+  const d = await live['zohoPeople.employeeLookup'].run({ name: 'nobody-here' }, MANAGER_LIVE);
+  assert.equal(d.count, 0);
+  assert.ok(/Nobody matching/.test(PEOPLE_TOOLS['zohoPeople.employeeLookup'].say(d)));
+  n++; console.log('ok   live tools: a lookup miss is an honest empty result');
+})();
+
+// ---- team hierarchy is disabled in live mode, and fails CLOSED ----
+ok(() => {
+  const m = buildPeopleManifest({
+    NEUIQ_DATA_SOURCE: 'zoho', ZOHO_CLIENT_ID: 'a', ZOHO_CLIENT_SECRET: 'b', ZOHO_REFRESH_TOKEN: 'c',
+  });
+  assert.equal(m.directory.hierarchyAvailable, false);
+  // No manager field was observed, so there is nothing to build a reporting line from. Leaving
+  // the seed's relationships wired up would mean deciding a real authorization question from
+  // generated demo data.
+  assert.equal(m.directory.byId('E1002'), null);
+}, 'live: the reporting hierarchy is switched off, not backed by seed relationships');
+ok(() => {
+  const m = buildPeopleManifest({});
+  assert.notEqual(m.directory.byId('E1002'), null);
+}, 'seed: the seed directory keeps its reporting line');
+
+// ---------------------------------------------------------------- manifest wiring
+ok(() => {
+  const m = buildPeopleManifest({});
+  assert.equal(m.dataSource, 'seed');
+  assert.equal(m.sources, SOURCES.leave ? m.sources : m.sources);
+  assert.equal(m.tools['zohoPeople.headcount'].scope, 'admin');
+}, 'manifest: defaults to the seed with the seed tools');
+throws(
+  () => buildPeopleManifest({ NEUIQ_DATA_SOURCE: 'zoho' }),
+  'manifest: zoho selected without OAuth configured REFUSES AT BOOT, not on first request',
+);
+ok(() => {
+  const m = buildPeopleManifest({
+    NEUIQ_DATA_SOURCE: 'zoho', ZOHO_CLIENT_ID: 'a', ZOHO_CLIENT_SECRET: 'b', ZOHO_REFRESH_TOKEN: 'c',
+  });
+  assert.equal(m.dataSource, 'zoho');
+  assert.ok(m.client);
+  // Same keys either way, so nothing above the manifest knows which is active.
+  assert.deepEqual(Object.keys(m.sources).sort(), ['attendance', 'employees', 'leave']);
+  assert.deepEqual(Object.keys(m.tools).sort(), Object.keys(PEOPLE_TOOLS).sort());
+}, 'manifest: configured zoho builds live sources and tools with identical keys');
+
+// ---------------------------------------------------------------- runQueryAsync + scope assertion
+await (async () => {
+  // The async path must produce exactly what the sync path does on the seed.
+  const spec = { source: 'leave', groupBy: 'leaveType', metric: 'sum', field: 'days' };
+  assert.deepEqual(await runQueryAsync(spec, ADMIN), runQuery(spec, ADMIN));
+  n++; console.log('ok   engine: runQueryAsync matches runQuery exactly on seed sources');
+})();
+await (async () => {
+  await assert.rejects(
+    () => runQueryAsync({ source: 'employees', groupBy: 'department' }, EMPLOYEE),
+    (e) => e.status === 403,
+  );
+  n++; console.log('ok   engine: the async path refuses an admin-only source with 403');
+})();
+ok(() => {
+  // THE misconfiguration that can actually happen: a source with no scope and no adminOnly flag
+  // is read in full by every caller, because there is nothing to pin it with and nothing to
+  // refuse it. Refused at registration rather than discovered in production.
+  assert.throws(
+    () => registerSources({ __unscoped: { label: 'x', group: ['a'], numeric: ['b'], scope: null } }),
+    /no scope function and is not adminOnly/,
+  );
+  assert.equal(SOURCES.__unscoped, undefined);
+}, 'engine: a source that is neither scopeable nor admin-only is REFUSED at registration');
+ok(() => {
+  // The two legal shapes both register.
+  registerSources({
+    __scoped: { label: 'x', group: ['a'], numeric: ['b'], scope: (id) => ({ field: 'employeeId', op: 'eq', value: id }), rows: () => [] },
+    __adminOnly: { label: 'y', group: ['a'], numeric: ['b'], scope: null, adminOnly: true, rows: () => [] },
+  });
+  assert.ok(SOURCES.__scoped && SOURCES.__adminOnly);
+}, 'engine: scopeable and admin-only sources both register');
+
+await (async () => {
+  // The post-query tripwire. Unreachable while `eq` is strict equality — the filter and the check
+  // derive the same clause — so it is exercised here with a scope that changes between the two
+  // calls, standing in for a future refactor that lets the two disagree. With data_select=ALL
+  // there is no second fence behind our filter, so this must fail loudly rather than serve.
+  let call = 0;
+  registerSources({
+    __drifting: {
+      label: 'Drifting', group: ['month'], numeric: ['days'],
+      scope: () => ({ field: 'employeeId', op: 'eq', value: call++ === 0 ? 'SOMEONE_ELSE' : 'E1001' }),
+      fetchRows: async () => [{ employeeId: 'SOMEONE_ELSE', days: 5, month: '2026-09' }],
+    },
+  });
+  await assert.rejects(
+    () => runQueryAsync({ source: '__drifting', metric: 'count' }, EMPLOYEE),
+    (e) => e.status === 500 && /Scoping check failed/.test(e.message),
+  );
+  n++; console.log('ok   engine: a row that survives filtering but fails the scope check is caught, not served');
+})();
 
 console.log(`\nall ${n} zoho integration checks pass`);

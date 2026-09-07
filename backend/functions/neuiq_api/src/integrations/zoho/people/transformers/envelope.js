@@ -126,32 +126,46 @@ export function flattenKeyedRecords(node) {
 /**
  * The path from a forms response body down to the keyed-records node.
  *
- * **Not confirmed.** What has been observed is that the employee endpoint returns 200 and that
- * the result is "nested and keyed by a record identifier" — the shape of the inner node, not the
- * names of the wrapper keys around it. Zoho's forms APIs have used more than one wrapper across
- * versions, so writing one here would be inventing API behaviour.
+ * **Confirmed 2026-09-07** against a real employee payload:
  *
- * Set this to the observed path (e.g. `['response', 'result']`) once a real body has been
- * captured. `unwrapForms` refuses to run until then; `flattenKeyedRecords` above already handles
- * everything below this point and is tested.
+ *   { "response": { "result": [ { "<record_id>": [ { EmailID, "Employee_type.id", ... } ] } ] } }
+ *
+ * So the path is `response.result`, and what sits there is an ARRAY of keyed-record objects
+ * rather than a single one — handled below.
+ *
+ * The env override remains because a different form or a future API version could nest
+ * differently, and changing a variable beats shipping a patch to find out. It is an override
+ * now, not a prerequisite: nothing has to be configured for the confirmed shape to work.
  */
-export const FORMS_RESULT_PATH = null;
+export const FORMS_RESULT_PATH =
+  parsePath(process.env.ZOHO_PEOPLE_FORMS_RESULT_PATH) ?? ['response', 'result'];
+
+/**
+ * Read the path from configuration, so confirming it does not require a code change.
+ *
+ * `ZOHO_PEOPLE_FORMS_RESULT_PATH=response.result` is all it takes once one real body has been
+ * captured. Made configurable rather than hardcoded because the person who captures the body is
+ * not necessarily the person who can ship a commit, and the alternative is that they guess.
+ */
+function parsePath(raw) {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return null;
+  const parts = trimmed.split('.').map((p) => p.trim()).filter(Boolean);
+  return parts.length ? parts : null;
+}
 
 /**
  * Unwrap a forms response.
  *
- * Throws until FORMS_RESULT_PATH is confirmed. That refusal is deliberate and is covered by a
- * test: a plausible-looking guess here would produce an empty employee list, which reads as "this
- * org has no employees" rather than as "we are looking in the wrong place".
+ * `response.result` holds an ARRAY of keyed-record objects. Every element is flattened and the
+ * results concatenated, rather than assuming a single element: whether Zoho returns one object
+ * carrying every record or one object per record was not part of what was captured, and both
+ * readings produce the same rows this way. Assuming "length 1" would silently return one
+ * employee out of fifty.
  */
 export function unwrapForms(payload, path = FORMS_RESULT_PATH) {
   if (!path) {
-    throw new EnvelopeError(
-      'forms: the result path is not confirmed yet. Capture one real response body from ' +
-      'GET /people/api/forms/employee/getRecords, set FORMS_RESULT_PATH, and the inner ' +
-      'flattening (flattenKeyedRecords) is already in place.',
-      { payload },
-    );
+    throw new EnvelopeError('forms: no result path configured', { payload });
   }
 
   let node = payload;
@@ -162,7 +176,16 @@ export function unwrapForms(payload, path = FORMS_RESULT_PATH) {
     node = node[key];
   }
 
-  // Some forms responses wrap the keyed node in a single-element array.
-  const target = Array.isArray(node) && node.length === 1 ? node[0] : node;
-  return flattenKeyedRecords(target);
+  if (node === undefined || node === null) {
+    throw new EnvelopeError(`forms: path ${path.join('.')} does not exist in the response`, { payload });
+  }
+
+  // An empty result array is a successful empty read, exactly like `data: []` on the v3 side.
+  if (Array.isArray(node)) {
+    const rows = [];
+    for (const element of node) rows.push(...flattenKeyedRecords(element).rows);
+    return result(rows);
+  }
+
+  return flattenKeyedRecords(node);
 }

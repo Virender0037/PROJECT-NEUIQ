@@ -18,7 +18,7 @@ import { directory } from './integrations/registry.js';
 import {
   requestId, logger, authenticate, errorHandler, notFound, issueToken,
 } from './core/middleware/index.js';
-import { runQuery } from './core/query/engine.js';
+import { runQueryAsync } from './core/query/engine.js';
 import { schemaFor } from './core/query/sources.js';
 import { isAdmin } from './core/policy/roles.js';
 import { cleanWidgets, cleanTitle, WIDGET_TYPES } from './core/dashboards/spec.js';
@@ -118,14 +118,20 @@ export function createApp() {
   })));
 
   // ---- query: the resolve path behind every widget ----
-  api.post('/query', wrap((req, res) => res.json(ok(req, runQuery(req.body, req.user)))));
+  // runQueryAsync so a live source can fetch. With the seed it falls through to the synchronous
+  // rows() and behaves identically — the scoping and aggregation code path is the same either way.
+  api.post('/query', wrap(async (req, res) => res.json(ok(req, await runQueryAsync(req.body, req.user, { signal: req.signal })))));
 
   // ---- analytics: the headline numbers a kpi tile reads ----
-  api.get('/analytics/summary', wrap((req, res) => {
-    const scoped = (spec) => runQuery(spec, req.user).data;
-    const leaveDays = scoped({ source: 'leave', metric: 'sum', field: 'days' })[0]?.value ?? 0;
-    const pending = scoped({ source: 'leave', groupBy: 'status', metric: 'count' }).find((r) => r.name === 'Pending')?.value ?? 0;
-    const avgHours = scoped({ source: 'attendance', metric: 'avg', field: 'hours' })[0]?.value ?? 0;
+  api.get('/analytics/summary', wrap(async (req, res) => {
+    const scoped = async (spec) => (await runQueryAsync(spec, req.user, { signal: req.signal })).data;
+    const leaveDays = (await scoped({ source: 'leave', metric: 'sum', field: 'days' }))[0]?.value ?? 0;
+    const pending = (await scoped({ source: 'leave', groupBy: 'status', metric: 'count' })).find((r) => r.name === 'Pending')?.value ?? 0;
+    // Attendance is unavailable on live data until its transformer exists; a KPI tile must not
+    // take the whole summary down with it, so this one degrades to 0 rather than throwing.
+    const avgHours = await scoped({ source: 'attendance', metric: 'avg', field: 'hours' })
+      .then((rows) => rows[0]?.value ?? 0)
+      .catch((err) => { if (err?.pending) return 0; throw err; });
     res.json(ok(req, {
       kpis: [
         // Headcount is admin-only, so a non-admin sees their own figures rather than a gap -

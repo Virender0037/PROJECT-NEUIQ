@@ -631,16 +631,47 @@ Two things that are easy to get wrong: point the generated function at the **exi
 
 ---
 
+## The Zoho OAuth model — decided 2026-09-07
+
+**Service account for the POC.** One refresh token, one Zoho identity, reading on every caller's
+behalf, with our policy layer deciding who may see what.
+
+The decision was blocked until `data_select=ALL` returned 200 on the leave endpoint. `MINE` is
+relative to whoever the token belongs to, so under a single identity it would have returned the
+service account's own leave rather than the caller's — which would have made per-user OAuth
+mandatory rather than optional.
+
+**What it costs, and the two things that follow from it.** Zoho applies no narrowing under `ALL`,
+so the read-time scoping in `core/policy/scope.js` is the *only* thing between an employee and the
+whole organisation's leave. There is no second fence behind it. Therefore:
+
+1. The **post-query row assertion** — verify every returned row's `employeeId` is inside the
+   caller's allowed set — is required before this is wired to live data, not optional. It turns a
+   scoping bug from a silent leak into a 500 with a log line.
+2. Confirming **`employee_zoho_ids`** (documented, untried) is **security work, not an
+   optimisation**. It restores server-side narrowing.
+
+**Per-user OAuth is production hardening, deliberately deferred, not dismissed.** Each user
+consents once, Zoho enforces authorisation natively, and ours becomes defence in depth. It needs
+an authorization-code flow, encrypted per-user token storage, a re-consent path, and a decision
+about a saved dashboard whose owner's grant has lapsed. `_shared/auth.service.js` is already
+shaped for it — the cache key widens, the grant does not change — so it is an extension rather
+than a rewrite. See the header of that file.
+
 ## Known blockers
 
 Neither is a coding task, and neither can be worked around.
 
-1. **`docs/backend/16-identity-authorization.md` is unwritten.** `06-auth-token-lifecycle.md`
-   covers *app → Zoho* OAuth; nothing covers *user → app*. It must define how a caller is
-   authenticated, how a caller resolves to a Zoho employee record, and an authorization layer
-   scoping every tool call (self / my reports / HR-admin) — and it must sit **below** the
-   orchestrator, because the LLM must never decide who may see what. Every guarantee in
-   `15-dashboards.md` rests on it. Until it exists, "scoped to the caller" has no subject.
+1. **`docs/backend/16-identity-authorization.md` is unwritten.** The *OAuth model* half is now
+   settled (above), but the rest is not: how a caller resolves to a Zoho employee record, and the
+   authorization layer scoping every tool call (self / my reports / HR-admin). It must sit
+   **below** the orchestrator, because the LLM must never decide who may see what. Every guarantee
+   in `15-dashboards.md` rests on it.
+
+   Newly concrete: **leave and attendance identify employees differently** — leave takes
+   `employee_zoho_ids` (erecno), attendance takes `employee_email_id` (email). There is no single
+   identifier addressing both, so `AuthzContext` has to carry an email→erecno mapping. Blocked on
+   a real employee-form payload.
 2. **No Zoho People sandbox.** The real tool catalogue depends on the client org's actual modules,
    leave types, attendance settings and custom forms.
 

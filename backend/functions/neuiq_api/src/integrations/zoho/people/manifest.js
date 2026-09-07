@@ -5,30 +5,90 @@
  * sources, and its employee directory. Core imports none of it — the composition root in
  * integrations/registry.js reads this and registers the parts.
  *
- * The point of the shape is the next product. Adding Zoho CRM should mean writing a second
- * manifest and adding one line to the registry, with **zero edits under core/**. If a future
- * product forces a core change, the abstraction is wrong and should be fixed rather than worked
- * around.
+ * ## Seed or live is decided here, once, at boot
  *
- * Fields the later phases will add, listed here so the shape is visible before it is needed:
+ * `NEUIQ_DATA_SOURCE` selects which set of sources and tools gets registered. The two sets share
+ * their contract exactly — same source keys, same tool names, same scopes, same `say()` — so
+ * nothing above this file knows which is active. There is no request-time branch and no fallback:
+ * a Zoho failure surfaces as an error, never as seed data. See people/dataSource.js.
  *
- *   scopes    OAuth scopes this product needs          (Phase 2)
- *   client    the authenticated API client             (Phase 3)
- *   health    reachability + token validity for /health (Phase 3)
- *   widgets   the builder's widget catalogue           (Phase 1)
- *   keywords  the keyword router's vocabulary          (Phase 1)
+ * Fields later phases will add: `health` (reachability for /health), `widgets` and `keywords`
+ * (moving the last People vocabulary out of core).
  */
 import { PEOPLE_SOURCES } from './sources.js';
 import { PEOPLE_TOOLS } from './tools/index.js';
 import { directory } from './directory.js';
+import { resolveDataSource } from './dataSource.js';
+import { configFromEnv, createTokenProvider, isConfigured } from '../_shared/auth.service.js';
+import { createPeopleClient } from './client.js';
+import { buildLiveSources } from './sources.live.js';
+import { buildLiveTools } from './tools/live.js';
 
-export default {
-  key: 'zoho.people',
-  vendor: 'zoho',
-  product: 'people',
-  label: 'Zoho People',
+/**
+ * Build the manifest for the configured data source.
+ *
+ * Takes the environment so the choice is testable without setting process-wide state.
+ */
+export function buildPeopleManifest(env = process.env) {
+  const resolved = resolveDataSource(env);
 
-  sources: PEOPLE_SOURCES,
-  tools: PEOPLE_TOOLS,
-  directory,
+  const base = {
+    key: 'zoho.people',
+    vendor: 'zoho',
+    product: 'people',
+    label: 'Zoho People',
+    dataSource: resolved.source,
+    directory,
+  };
+
+  if (resolved.isSeed) {
+    return { ...base, sources: PEOPLE_SOURCES, tools: PEOPLE_TOOLS, client: null };
+  }
+
+  const config = configFromEnv(env);
+  if (!isConfigured(config)) {
+    // Refuse at boot rather than on the first request. A server that starts and then fails every
+    // question is harder to diagnose than one that says why it would not start.
+    throw new Error(
+      'zoho.people: NEUIQ_DATA_SOURCE=zoho but OAuth is not configured. '
+      + 'Set ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET and ZOHO_REFRESH_TOKEN — see backend/.env.example.',
+    );
+  }
+
+  const tokenProvider = createTokenProvider({ config });
+  const client = createPeopleClient({ dc: config.dc, tokenProvider });
+
+  return {
+    ...base,
+    sources: buildLiveSources({ client }),
+    tools: buildLiveTools({ client }),
+    directory: liveDirectory,
+    client,
+    tokenProvider,
+  };
+}
+
+/**
+ * The directory in live mode, with the reporting hierarchy switched OFF.
+ *
+ * No manager or reporting field appeared in the captured employee payload, so there is nothing to
+ * build a manager -> direct-reports relationship from. The seed HAS such a relationship, and
+ * leaving it wired up in live mode would be the worst of both: `resolveSubject` would let a
+ * manager read a "direct report" chosen by generated demo data that has no connection to the real
+ * org chart. That is an authorization decision made from fabricated input.
+ *
+ * So `byId` returns null. `resolveSubject` then finds no subject to match against and throws 403 —
+ * it fails CLOSED. Reading yourself still works, and an admin still reads anyone, because both of
+ * those paths return before the directory is consulted. What is refused is exactly the case that
+ * cannot currently be decided correctly.
+ *
+ * This is restored by confirming a reporting field on the employee form, not by writing code.
+ */
+const liveDirectory = {
+  ...directory,
+  byId: () => null,
+  hierarchyAvailable: false,
 };
+
+/** The manifest for this process. */
+export default buildPeopleManifest();

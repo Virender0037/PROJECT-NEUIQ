@@ -22,13 +22,32 @@
  * **Expiry has a skew.** A token that expires in ten seconds is treated as expired. Handing out a
  * token that dies mid-flight produces a 401 that looks like a permissions bug.
  *
- * ## What it does not do yet
+ * ## The OAuth model — decided 2026-09-07
  *
- * No authorization-code flow, and no per-user tokens. Which of those we need is not a coding
- * decision: the leave endpoint scopes with `data_select=MINE`, which is relative to whoever the
- * token belongs to, and that interacts with whether one service identity queries on everyone's
- * behalf. See the OAuth model question in the Phase plan. The refresh-token grant below is common
- * to both answers, which is why it is the part that could be built now.
+ * **Service account for the POC.** One refresh token, one Zoho identity, reading on every
+ * caller's behalf. This was an open question until `data_select=ALL` returned 200 on the leave
+ * endpoint: `MINE` is relative to whoever the token belongs to, so under a single identity it
+ * would have returned the service account's own leave rather than the caller's, and per-user
+ * OAuth would have been mandatory rather than optional.
+ *
+ * The refresh-token grant below is exactly what that model needs, and it is complete.
+ *
+ * **What the decision costs.** Zoho applies no narrowing under `ALL`, so our read-time scoping in
+ * core/policy/scope.js is the only thing between an employee and the whole organisation's leave.
+ * See the warning on `dataSelectFor` in people/endpoints.js — the post-query row assertion stops
+ * being optional the moment this is wired to live data.
+ *
+ * ## Per-user OAuth — production hardening, not built
+ *
+ * Each user consents once and the app holds their token, so Zoho enforces authorisation natively
+ * and ours becomes defence in depth rather than the sole control. That is the right end state for
+ * anything handling real HR data, and it is deliberately deferred rather than dismissed.
+ *
+ * It needs, none of which exists: an authorization-code flow with a redirect endpoint, encrypted
+ * per-user refresh-token storage, a re-consent path for expiry or revocation, and a decision
+ * about what happens to a saved dashboard when its owner's grant lapses. The provider below is
+ * already shaped for it — `getAccessToken({ dc })` becomes `getAccessToken({ dc, connection })`
+ * and the cache key widens — so adopting it is an extension, not a rewrite.
  */
 import { accountsBase, DEFAULT_DC } from './datacenters.js';
 import { mapHttpError, mapNetworkError, ZohoAuthError, redact } from './errors.js';

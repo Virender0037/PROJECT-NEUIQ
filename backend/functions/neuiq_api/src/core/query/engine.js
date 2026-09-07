@@ -90,6 +90,30 @@ const MONTH_LABEL = (key) => {
  * user told "no data" when the real answer is "not for you" will keep asking.
  */
 export function runQuery(raw, user) {
+  const { spec, src, filters } = prepare(raw, user);
+  return assemble(spec, src, filters, src.rows(), user);
+}
+
+/**
+ * The same query, for a source whose rows arrive over the network.
+ *
+ * A live source declares `fetchRows(ctx)` instead of a synchronous `rows()`. Everything else —
+ * whitelisting, scoping, the 403, grouping, aggregation — is the identical code path, because a
+ * second implementation of the scoping rules is a second place for them to drift.
+ *
+ * `runQuery` above keeps its exact synchronous signature so the seed path and every assertion
+ * written against it are untouched.
+ */
+export async function runQueryAsync(raw, user, ctx = {}) {
+  const { spec, src, filters } = prepare(raw, user);
+  const rows = typeof src.fetchRows === 'function'
+    ? await src.fetchRows({ ...ctx, spec, user })
+    : src.rows();
+  return assemble(spec, src, filters, rows, user);
+}
+
+/** Whitelist, resolve the source, and work out the scope filters. Shared by both entry points. */
+function prepare(raw, user) {
   const spec = sanitize(raw);
   if (!spec) {
     const e = new Error('Unknown data source');
@@ -103,7 +127,22 @@ export function runQuery(raw, user) {
   // scopeFilters throws 403 for an admin-only source, so this line is also the refusal.
   const filters = [...(spec.filter || []), ...scopeFilters(src, user)];
 
-  let rows = src.rows().filter((row) => filters.every((f) => matches(row, f)));
+  return { spec, src, filters };
+}
+
+/**
+ * Filter, verify, group and aggregate.
+ *
+ * The verify step is not redundant. Under the service-account model Zoho applies no narrowing of
+ * its own — every leave read goes out as `data_select=ALL` — so the ownership filter below is the
+ * only thing between an employee and the whole organisation's records. Checking the rows that
+ * survived actually carry the caller's id turns a scoping bug from a silent leak into a 500 with
+ * a log line. It costs one pass over rows already in memory.
+ */
+function assemble(spec, src, filters, allRows, user) {
+  let rows = (Array.isArray(allRows) ? allRows : []).filter((row) => filters.every((f) => matches(row, f)));
+
+  assertScopeHeld(rows, src, user);
 
   // No grouping: a single aggregate over the whole set.
   const metric = spec.metric || 'count';
@@ -143,6 +182,36 @@ export function runQuery(raw, user) {
     data,
     meta: { source: spec.source, groupBy: spec.groupBy, metric, field: spec.field, scoped: !isAdmin(user) },
   };
+}
+
+/**
+ * Belt and braces: every surviving row must actually belong to the caller.
+ *
+ * **This is unreachable while `matches()` implements `eq` as strict equality**, because the check
+ * re-derives the same clause the filter just applied. That is deliberate, and it is the point: it
+ * is a tripwire for a future change, not a guard against today's code. If someone loosens `eq`,
+ * adds a path that skips `filters`, or makes a source's `scope` depend on anything mutable, this
+ * turns the resulting leak into a 500 with a log line instead of another employee's leave on
+ * screen. It costs one pass over rows already in memory.
+ *
+ * The misconfiguration that CAN happen today — a source with neither `scope` nor `adminOnly` — is
+ * refused at registration instead, in core/query/sources.js.
+ *
+ * Only runs when a scope was applied: an admin read is unscoped by design, and a source with no
+ * owner field has no ownership to check. Throws rather than filtering the offender out, because
+ * silently repairing a leak hides the bug that caused it.
+ */
+function assertScopeHeld(rows, src, user) {
+  if (isAdmin(user) || !src.scope || !user?.employeeId) return;
+
+  const { field, value } = src.scope(user.employeeId);
+  for (const row of rows) {
+    if (row[field] !== value) {
+      const e = new Error('Scoping check failed: a row outside the caller\'s scope survived filtering.');
+      e.status = 500;
+      throw e;
+    }
+  }
 }
 
 function aggregate(rows, metric, field) {

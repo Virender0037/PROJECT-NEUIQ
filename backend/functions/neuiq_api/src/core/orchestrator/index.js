@@ -148,7 +148,9 @@ export async function answer({ message, history = [], user, requestId }) {
   }
 
   const args = validateArgs(routed.tool, routed.args || {});
-  const data = tool.run(args, user);
+  // Awaited so the same pipeline serves both tool sets: the seed tools are synchronous, the live
+  // ones return promises, and `await` on a plain value is a no-op.
+  const data = await tool.run(args, user);
 
   return {
     outcome: 'ok',
