@@ -1,10 +1,33 @@
+# dependencies
 node_modules
+
+# builds
 dist
 dist-ssr
 *.local
+
+# env / secrets — never commit Zoho or Gemini credentials
+.env
+.env.*
+!.env.example
+
+# Catalyst CLI
+.catalystrc
+catalyst-cli.log
+.catalyst/
+
+# editors / os
 .DS_Store
 .vscode/*
 !.vscode/extensions.json
+
+# logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# generated runtime store — regenerated on first run, never a fixture
+backend/db/
+
+# Catalyst CLI — carries the client's project and org IDs
+catalyst.json

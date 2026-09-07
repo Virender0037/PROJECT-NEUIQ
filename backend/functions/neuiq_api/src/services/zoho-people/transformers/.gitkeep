@@ -1,0 +1,1 @@
+raw Zoho response -> normalized shape + field whitelist (never pass raw records to the LLM)

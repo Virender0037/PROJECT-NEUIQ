@@ -1,0 +1,22 @@
+{
+  "name": "neuiq",
+  "private": true,
+  "version": "1.0.0",
+  "description": "NeuIQ \u2014 an AI-assistant chat workspace (React 18).",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "node test/dashboards.check.mjs"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.30.6"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^8.2.2"
+  }
+}

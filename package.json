@@ -1,20 +1,16 @@
 {
   "name": "neuiq",
   "private": true,
-  "version": "1.0.0",
-  "description": "NeuIQ — an AI-assistant chat workspace (React 18).",
+  "version": "0.1.0",
+  "description": "NeuIQ — a conversational AI layer over Zoho People. Frontend and backend in one repo.",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
+    "dev": "node scripts/dev.mjs",
+    "check": "npm --prefix backend run check && npm --prefix frontend run check",
+    "install:all": "npm --prefix backend install && npm --prefix frontend install --legacy-peer-deps",
+    "build": "npm --prefix frontend run build"
   },
-  "dependencies": {
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
-  },
-  "devDependencies": {
-    "@vitejs/plugin-react": "^4.3.1",
-    "vite": "^8.2.2"
+  "engines": {
+    "node": ">=20"
   }
 }

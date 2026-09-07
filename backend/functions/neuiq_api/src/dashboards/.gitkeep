@@ -1,0 +1,1 @@
+routes | store (ZCQL) | spec (widget schema + validation + migration) | resolver (spec -> tool -> value, batched/capped) | viz-catalog (allow-listed viz types)

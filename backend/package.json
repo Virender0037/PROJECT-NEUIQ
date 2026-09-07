@@ -1,0 +1,16 @@
+{
+  "name": "neuiq-api",
+  "private": true,
+  "version": "0.1.0",
+  "description": "NeuIQ backend — orchestrator over Zoho People, plus on-demand dashboards.",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch server.js",
+    "start": "node server.js",
+    "check": "node tests/check.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  },
+  "engines": { "node": ">=20" }
+}

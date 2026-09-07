@@ -1,0 +1,251 @@
+/* ==========================================================================
+   NeuIQ additions to the Hybrid design system.
+
+   global.css is kept byte-for-byte as copied from the asset-management project so it can be
+   re-synced when that design system moves. Anything NeuIQ needs and it does not have goes
+   here instead, and this file is loaded after it.
+   ========================================================================== */
+
+/* ==========================================================================
+   MOTION
+   One duration/easing scale for the whole style, so nothing invents its own
+   timing. The curve is a gentle ease-out with no overshoot - motion should
+   read as finished, not bouncy.
+
+   Everything animated here is `transform` or `opacity`. Both are composited
+   off the main thread, so a grid of twenty cards still hits frame budget;
+   animating `height`, `top` or `width` would force layout on every frame.
+   ========================================================================== */
+:root {
+  --ease: cubic-bezier(.32, .72, 0, 1);
+  --t-fast: .12s;
+  --t-base: .2s;
+  --t-slow: .34s;
+}
+
+/* Themes cross-fade rather than snapping. Colour properties only - `all` here would
+   animate layout on every re-render and make the whole app feel laggy. */
+body {
+  transition: background var(--t-slow) ease, color var(--t-slow) ease;
+}
+
+/* Screens announce themselves with one short rise. `.route-view` is keyed on the view in the
+   shell, so this replays on navigation instead of only on first mount. */
+@keyframes hyRise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+@keyframes hyFade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes hyPop { from { opacity: 0; transform: scale(.97) translateY(6px); } to { opacity: 1; transform: none; } }
+
+.route-view { animation: hyRise var(--t-slow) var(--ease) both; }
+
+/* Cards and rows stagger in behind their screen. Six steps then stop: past about six the
+   last item arrives late enough to feel broken rather than choreographed. */
+.dw-grid > *, .neuiq-list > *, .hy-themegrid > *, .neuiq-suggest > * {
+  animation: hyPop .3s var(--ease) both;
+}
+.dw-grid > *:nth-child(1), .neuiq-list > *:nth-child(1), .hy-themegrid > *:nth-child(1), .neuiq-suggest > *:nth-child(1) { animation-delay: .02s; }
+.dw-grid > *:nth-child(2), .neuiq-list > *:nth-child(2), .hy-themegrid > *:nth-child(2), .neuiq-suggest > *:nth-child(2) { animation-delay: .05s; }
+.dw-grid > *:nth-child(3), .neuiq-list > *:nth-child(3), .hy-themegrid > *:nth-child(3), .neuiq-suggest > *:nth-child(3) { animation-delay: .08s; }
+.dw-grid > *:nth-child(4), .neuiq-list > *:nth-child(4), .hy-themegrid > *:nth-child(4), .neuiq-suggest > *:nth-child(4) { animation-delay: .11s; }
+.dw-grid > *:nth-child(5), .neuiq-list > *:nth-child(5), .hy-themegrid > *:nth-child(5), .neuiq-suggest > *:nth-child(5) { animation-delay: .14s; }
+.dw-grid > *:nth-child(n+6), .neuiq-list > *:nth-child(n+6), .hy-themegrid > *:nth-child(n+6), .neuiq-suggest > *:nth-child(n+6) { animation-delay: .17s; }
+
+/* Chat messages rise one at a time as they arrive. */
+.neuiq-chat > * { animation: hyRise .32s var(--ease) both; }
+
+/* The analytics tab indicator and the dock's sliding span both animate transform only. */
+.an-tab { transition: background var(--t-fast) ease, color var(--t-fast) ease, border-color var(--t-fast) ease; }
+
+/* Someone who asked the OS for less motion gets none of it. Not a nicety: vestibular
+   triggers are an accessibility failure, not a preference. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* streaming caret — the assistant reveal has no analogue in the source app */
+@keyframes blink { 50% { opacity: 0; } }
+
+/* the chat surface is a reading column, not a table page: the source .page padding is tuned
+   for dense data screens and leaves assistant prose too wide to scan comfortably */
+.neuiq-chat { max-width: 780px; margin: 0 auto; display: flex; flex-direction: column; gap: 26px; }
+
+/* suggestion cards on the empty state */
+.neuiq-suggest { display: grid; grid-template-columns: repeat(auto-fit, minmax(232px, 1fr)); gap: 12px; }
+.neuiq-suggest button {
+  display: flex; gap: 11px; align-items: flex-start; text-align: left; cursor: pointer;
+  padding: 14px; border-radius: 6px; border: 1px solid var(--hairline);
+  background: var(--glass); color: var(--ink); font-family: inherit;
+  transition: border-color .16s ease, transform .16s ease;
+}
+.neuiq-suggest button:hover { border-color: rgba(var(--accent-rgb), .45); transform: translateY(-2px); }
+
+/* a plain list row used by History, Tasks and the project workspace */
+.neuiq-row {
+  display: flex; align-items: center; gap: 12px; width: 100%; text-align: left;
+  padding: 13px 15px; border: 1px solid var(--hairline); border-radius: 6px;
+  background: var(--glass); color: var(--ink); font-family: inherit; font-size: 14px;
+  cursor: pointer; transition: border-color .16s ease, background .16s ease;
+}
+.neuiq-row:hover { border-color: rgba(var(--accent-rgb), .45); }
+.neuiq-list { display: flex; flex-direction: column; gap: 8px; }
+
+/* section label above a group of rows */
+.neuiq-group-label {
+  font-size: 10.5px; font-weight: 750; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--ink-dim); margin: 22px 0 9px;
+}
+.neuiq-group-label:first-child { margin-top: 0; }
+
+/* the weekly-usage bars on Overview: plain divs, themed by token, no chart library */
+.neuiq-bars { display: flex; align-items: flex-end; gap: 14px; height: 150px; }
+.neuiq-bars > div { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 8px; height: 100%; justify-content: flex-end; }
+.neuiq-bar { width: 100%; max-width: 34px; border-radius: 5px 5px 0 0; background: var(--hairline); transition: height .4s ease-out; }
+.neuiq-bar.on { background: linear-gradient(180deg, var(--accent), var(--accent-2)); }
+
+/* full-screen gates (landing / auth) sit above the shell */
+.neuiq-gate {
+  position: fixed; inset: 0; z-index: 400; display: flex; align-items: center; justify-content: center;
+  padding: 24px; background: var(--bg); overflow-y: auto;
+}
+
+/* ---- analytics: one shell, three tabs ---- */
+.an-view { display: flex; flex-direction: column; gap: 18px; }
+.an-bar {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding-bottom: 14px; border-bottom: 1px solid var(--hairline);
+}
+.an-tabs { display: flex; gap: 4px; flex: 0 0 auto; }
+.an-tab {
+  display: inline-flex; align-items: center; gap: 7px; cursor: pointer;
+  padding: 8px 13px; border-radius: 5px; border: 1px solid transparent;
+  background: transparent; color: var(--ink-2); font-family: inherit;
+  font-size: 13.5px; font-weight: 600; transition: background .15s ease, color .15s ease;
+}
+.an-tab:hover { background: var(--hairline-2); color: var(--ink); }
+.an-tab.on { background: var(--accent-soft); border-color: rgba(var(--accent-rgb), .34); color: var(--accent); }
+/* the strapline is the first thing to go when the bar runs out of room - the tabs and the
+   action button both still work without it, the sentence does not */
+.an-hint { flex: 1 1 260px; min-width: 0; font-size: 12.5px; color: var(--ink-dim); }
+.an-acts { flex: 0 0 auto; margin-left: auto; display: flex; gap: 8px; }
+.an-body { min-width: 0; }
+
+/* ---- chart builder: controls beside a live preview ---- */
+.cb-split { display: grid; grid-template-columns: 268px 1fr; gap: 16px; align-items: start; }
+@media (max-width: 900px) { .cb-split { grid-template-columns: 1fr; } }
+
+/* ==========================================================================
+   Settings — the appearance pickers.
+   Classes rather than inline styles because these need :hover and :disabled,
+   which an inline style object cannot express.
+   ========================================================================== */
+.hy-sub { font-size: 12.5px; color: var(--ink-dim); margin-bottom: 14px; line-height: 1.5; }
+
+.hy-tick {
+  width: 18px; height: 18px; flex: 0 0 auto; border-radius: 999px;
+  background: var(--accent); color: #fff; display: grid; place-items: center;
+}
+
+/* ---- UI style rows ---- */
+.hy-stylelist { display: flex; flex-direction: column; gap: 8px; }
+.hy-stylerow {
+  display: flex; align-items: center; gap: 13px; width: 100%; cursor: pointer;
+  padding: 12px 14px; border-radius: 6px; border: 2px solid var(--hairline);
+  background: var(--glass); color: var(--ink); font-family: inherit;
+  transition: border-color var(--t-base) var(--ease), transform var(--t-base) var(--ease);
+}
+.hy-stylerow:hover:not(:disabled) { border-color: rgba(var(--accent-rgb), .45); transform: translateY(-2px); }
+.hy-stylerow.on { border-color: var(--accent); }
+.hy-stylerow:disabled { opacity: .5; cursor: not-allowed; }
+
+/* ---- theme cards ---- */
+.hy-themegrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 12px; }
+.hy-themecard {
+  text-align: left; cursor: pointer; padding: 11px; border-radius: 6px;
+  border: 2px solid var(--hairline); background: var(--glass); color: var(--ink);
+  font-family: inherit;
+  transition: border-color var(--t-base) var(--ease), transform var(--t-base) var(--ease);
+}
+.hy-themecard:hover { border-color: rgba(var(--accent-rgb), .45); transform: translateY(-2px); }
+.hy-themecard.on { border-color: var(--accent); }
+.hy-themeprev {
+  display: block; position: relative; height: 56px; border-radius: 5px; overflow: hidden;
+  margin-bottom: 10px; border: 1px solid var(--hairline);
+}
+
+/* ---- accent swatches ---- */
+.hy-accent {
+  width: 36px; height: 36px; border-radius: 8px; cursor: pointer; color: #fff;
+  border: 2px solid transparent; display: grid; place-items: center;
+  box-shadow: var(--shadow-sm);
+  transition: transform var(--t-base) var(--ease), border-color var(--t-base) var(--ease);
+}
+.hy-accent:hover { transform: translateY(-2px); }
+.hy-accent.on { border-color: var(--ink); }
+
+/* ---- toggle ----
+   The knob's `left` is animated, not just the track colour: the travel is what reads as
+   "this turned on", and a colour swap alone is easy to miss. */
+.hy-toggle {
+  width: 42px; height: 23px; flex: 0 0 auto; border-radius: 999px; border: none; padding: 0;
+  cursor: pointer; position: relative; background: var(--hairline);
+  transition: background var(--t-base) ease;
+}
+.hy-toggle[data-on] { background: var(--accent); }
+.hy-toggle > span {
+  position: absolute; top: 2px; left: 2px; width: 19px; height: 19px; border-radius: 50%;
+  background: #fff; box-shadow: var(--shadow-sm);
+  transition: left var(--t-base) var(--ease);
+}
+.hy-toggle[data-on] > span { left: 21px; }
+
+/* ---------- widget load / provenance states ---------- */
+/* A skeleton at the card's real height, so the grid does not reflow when data lands. */
+.dw-skel {
+  height: 190px;
+  border-radius: 10px;
+  background: linear-gradient(100deg, var(--panel-2) 30%, var(--hover) 50%, var(--panel-2) 70%);
+  background-size: 220% 100%;
+  animation: dw-shimmer 1.15s var(--ease, ease) infinite;
+}
+@keyframes dw-shimmer { from { background-position: 100% 0; } to { background-position: -60% 0; } }
+
+/* "These figures are not from Zoho." Small, but it must be legible — an unreadable provenance
+   marker is the same as no marker. */
+.dw-tag {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dw-skel { animation: none; background: var(--panel-2); }
+}
+
+/* A build that failed says why, in the modal, where the prompt still is. */
+.adb-error {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--danger, var(--warn));
+  background: rgba(var(--accent-rgb), .04);
+  color: var(--ink-2);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* A tool this account cannot call: visible but clearly out of reach. Hiding it would leave the
+   user unsure whether the assistant has the capability at all. */
+.ai-tool-off { opacity: .5; }
+.ai-tool-off .chip { border-color: var(--hairline); color: var(--ink-dim); }
