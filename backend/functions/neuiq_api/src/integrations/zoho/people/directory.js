@@ -23,6 +23,14 @@ export const directory = {
 
   byId: (employeeId) => dataset.employees.find((e) => e.employeeId === employeeId) || null,
 
+  /** The seed has a reporting line; live mode switches this off (people/manifest.js). */
+  hierarchyAvailable: true,
+
+  /** Direct reports of one employee — what team scope and the manager check are decided from. */
+  reportsOf: (managerId) => dataset.employees
+    .filter((e) => managerId && e.managerId === managerId)
+    .map((e) => e.employeeId),
+
   byUsername: (username) => dataset.employees.find((e) => e.username === username) || null,
 
   /** The demo account picker. Fields chosen deliberately — no email, no tenure, no manager line. */

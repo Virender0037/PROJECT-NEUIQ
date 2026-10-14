@@ -5,7 +5,7 @@
   "description": "NeuIQ backend — orchestrator over Zoho People, plus on-demand dashboards.",
   "type": "module",
   "scripts": {
-    "dev": "node --watch server.js",
+    "dev": "node --env-file-if-exists=.env --watch server.js",
     "start": "node server.js",
     "check": "node tests/check.mjs && node tests/zoho.check.mjs"
   },

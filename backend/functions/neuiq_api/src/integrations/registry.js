@@ -41,3 +41,11 @@ setDirectory(people.directory);
 
 /** The employee directory, for the composition root's own use in app.js. */
 export const directory = people.directory;
+
+/**
+ * Where People records come from, as clients may see it: 'seed' | 'zoho' | null.
+ *
+ * Read from the manifest, which resolved it once at boot — the same decision that registered the
+ * sources and tools above — so what /health reports cannot disagree with what is serving data.
+ */
+export const dataSource = people.publicDataSource ?? null;

@@ -6,21 +6,24 @@
  * catalogue. Separating them is what lets a second product register tools without either one
  * knowing about the other.
  *
- * Every registered tool declares four things, and the shape is what makes the guardrails
+ * Every registered tool declares five things, and the shape is what makes the guardrails
  * enforceable rather than aspirational:
  *
- *   params   a schema the orchestrator's arguments are validated against. Not advisory: a call
- *            with an unknown or wrong-typed parameter is refused before it runs.
- *   scope    who may call it at all — 'self' | 'team' | 'admin'. Checked against the caller's
- *            role by this registry, never by the tool body and never by the model.
- *   run      the fetch. Returns NORMALIZED, FIELD-WHITELISTED data.
- *   say      turns the result into a sentence. Deterministic, so the number in the answer is
- *            always the number the tool returned.
+ *   params       a schema the orchestrator's arguments are validated against. Not advisory: a
+ *                call with an unknown or wrong-typed parameter is refused before it runs.
+ *   scope        who may call it at all — 'self' | 'team' | 'admin'. Checked against the caller's
+ *                role by this registry, never by the tool body and never by the model.
+ *   run          the fetch. Returns NORMALIZED, FIELD-WHITELISTED data.
+ *   subjectRows  (data) => the rows in a result that are ABOUT an employee, each carrying
+ *                `employeeId`. What `assertResultAllowed` checks. Aggregates return [].
+ *   say          turns the result into a sentence. Deterministic, so the number in the answer is
+ *                always the number the tool returned.
  *
  * That last one is the important one. The model chooses a tool and its parameters; it does not
  * write the figures. `say()` is why a wrong answer is a code bug rather than a hallucination.
  */
 import { rankAllows } from '../policy/roles.js';
+import { allowedEmployeeIds, assertRowsWithin } from '../policy/authorize.js';
 import { validateArgsFor } from './validate.js';
 
 /**
@@ -35,6 +38,11 @@ export const TOOLS = {};
 export function registerTools(defs) {
   for (const [name, def] of Object.entries(defs || {})) {
     if (TOOLS[name]) throw new Error(`tools: "${name}" is already registered`);
+    // Refused at boot, not defaulted. A tool that cannot say which of its rows are about whom
+    // cannot have its output checked, and a default of "nothing to check" is a bypass.
+    if (typeof def?.subjectRows !== 'function') {
+      throw new Error(`tools: "${name}" must declare subjectRows(data) so its results can be authorized`);
+    }
     TOOLS[name] = def;
   }
 }
@@ -50,6 +58,18 @@ export function mayCall(toolName, user) {
   const tool = TOOLS[toolName];
   if (!tool) return false;
   return rankAllows(tool.scope, user?.role);
+}
+
+/**
+ * Check a tool's result against the caller before it leaves the server.
+ *
+ * Runs after `run`, on every call, from the orchestrator — not inside each tool — so a tool that
+ * forgets its own filter is still caught, and nothing that routes to a tool (the keyword router,
+ * the model, a future caller) can return its data without passing through here.
+ */
+export function assertResultAllowed(toolName, data, user) {
+  assertRowsWithin(TOOLS[toolName].subjectRows(data), allowedEmployeeIds(user));
+  return data;
 }
 
 /** Validate arguments against a registered tool's schema. Refuses; never drops. */

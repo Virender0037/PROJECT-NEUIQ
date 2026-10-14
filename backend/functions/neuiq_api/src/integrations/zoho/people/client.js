@@ -11,13 +11,56 @@
  */
 import { createZohoClient } from '../_shared/client.js';
 import { endpoint, dataSelectFor } from './endpoints.js';
-import { dateRangeParams } from './transformers/dates.js';
+import { dateRangeParams, toZohoDate } from './transformers/dates.js';
 import { unwrapV3, unwrapForms } from './transformers/envelope.js';
+import { isZohoRecordId, LeaveBalanceUnavailableError, BALANCE_UNAVAILABLE } from './transformers/balance.js';
+import { createRateLimiter } from '../_shared/rateLimiter.js';
 
-export function createPeopleClient({ dc, tokenProvider, fetchImpl, logger, requestId = null }) {
+/**
+ * The Booked and Balance limiter: 20 a minute against Zoho's documented 30, and the documented
+ * two-minute lockout once Zoho says 429. Headroom because the limit is per process (see
+ * rateLimiter.js) and a lockout stops every user's balance, not one.
+ */
+export const BALANCE_RATE_LIMIT = Object.freeze({ limit: 20, windowMs: 60_000, lockoutMs: 120_000 });
+
+export function createPeopleClient({
+  dc, tokenProvider, fetchImpl, logger, requestId = null,
+  balanceLimiter = createRateLimiter({ name: 'Zoho leave balance', ...BALANCE_RATE_LIMIT }),
+}) {
   const http = createZohoClient({ product: 'people', dc, tokenProvider, fetchImpl, logger });
 
   return {
+    /**
+     * The Booked and Balance report for exactly ONE employee, over [from, to] (ISO dates).
+     *
+     * Returns the raw body; transformers/balance.js reads it. Refuses — before any request — an
+     * id that is not a Zoho erecno, so nothing but a single verified id is ever sent and there is
+     * no path to an organisation-wide report. Not retried on 5xx (see endpoints.js), and
+     * rate-limited locally so this endpoint never trips Zoho's two-minute lockout.
+     */
+    async leaveBalance({ employeeId, from, to, signal }) {
+      if (!isZohoRecordId(employeeId)) {
+        throw new LeaveBalanceUnavailableError(BALANCE_UNAVAILABLE.NOT_LINKED, 'this account is not linked to a Zoho People employee record.');
+      }
+      const ep = endpoint('people.leave.balance');
+      const params = {
+        from: toZohoDate(from),
+        to: toZohoDate(to),
+        unit: 'Day',
+        employee: JSON.stringify([employeeId]),
+      };
+      balanceLimiter.acquire();
+      try {
+        return await http.get(ep.path, { params, signal, requestId, retry: ep.retryOn5xx });
+      } catch (err) {
+        if (err?.status === 429) balanceLimiter.lockout(err.retryAfterSeconds);
+        throw err;
+      }
+    },
+
+    /** Limiter state, for tests and diagnostics. Counts only. */
+    balanceLimitStatus: () => balanceLimiter.status(),
+
     /**
      * Employee form records.
      *

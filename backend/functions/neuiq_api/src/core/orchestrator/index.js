@@ -18,7 +18,7 @@
  *     branch has to guess, and a confident wrong answer about someone's leave is worse than a
  *     question.
  */
-import { TOOLS, mayCall, validateArgs, catalogue } from '../tools/registry.js';
+import { TOOLS, mayCall, validateArgs, catalogue, assertResultAllowed } from '../tools/registry.js';
 import { route as llmRoute, available as llmAvailable, modelName } from '../ai/gemini.js';
 
 /**
@@ -151,6 +151,10 @@ export async function answer({ message, history = [], user, requestId }) {
   // Awaited so the same pipeline serves both tool sets: the seed tools are synchronous, the live
   // ones return promises, and `await` on a plain value is a no-op.
   const data = await tool.run(args, user);
+  // ---- and check what came back, before any of it reaches the response ----
+  // `data` is returned to the client verbatim below, so this is the last point a row outside the
+  // caller's scope can be stopped. Throws a 500; the detail goes to the log, not the body.
+  assertResultAllowed(routed.tool, data, user);
 
   return {
     outcome: 'ok',

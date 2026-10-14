@@ -28,9 +28,17 @@
  * two without this mapping. Whether `__recordId` IS the erecno is unconfirmed — see the gap note.
  */
 
+/**
+ * A field as a string, or null.
+ *
+ * A number is accepted only while it is a safe integer (or a finite non-integer). An unsafe
+ * integer has ALREADY been rounded by whoever parsed it — `_shared/client.js` keeps those as exact
+ * strings precisely so they never reach here as numbers — and `String()` of it would be a
+ * plausible-looking wrong id. Null fails closed; a wrong id could match the wrong person.
+ */
 const str = (v) => {
   if (typeof v === 'string') return v === '' ? null : v;
-  if (typeof v === 'number') return String(v);
+  if (typeof v === 'number') return Number.isFinite(v) && (!Number.isInteger(v) || Number.isSafeInteger(v)) ? String(v) : null;
   return null;
 };
 
@@ -133,16 +141,17 @@ export const DROPPED_PII_FIELDS = Object.freeze([
  */
 export const EMPLOYEE_GAPS = Object.freeze({
   identifiers:
-    'The employee ID field name is unknown. __recordId is used — the key the record is filed '
-    + "under — but whether it is the erecno that leave's employee_zoho_ids expects is unconfirmed. "
-    + 'Verify before relying on the join.',
+    'RESOLVED (2026-10-13): __recordId is the canonical id and equals Zoho_ID and leave '
+    + "employee.zoho_id exactly (the erecno employee_zoho_ids takes), once 18-digit numbers are "
+    + 'parsed precision-safely. ZUID is the separate Zoho ACCOUNT id. Identity lives in '
+    + 'transformers/employeeIdentity.js, not in this HR-facing transformer.',
   names:
-    'No first/last name field observed, so employee rows carry no name. employeeLookup therefore '
-    + 'matches on email, and any tool that needs to print a person\'s name is blocked on a fuller '
-    + 'payload.',
+    'FirstName/LastName are now observed and carried by the IDENTITY transformer only '
+    + '(employeeIdentity.js). This transformer still emits no name, so employeeLookup still matches '
+    + 'on email until a tool is deliberately given names.',
   orgFields:
-    'No designation, location or reporting-manager field observed. headcount can only group by '
-    + 'department on live data, and the manager -> direct-reports relationship cannot be built at '
-    + 'all — so team-scoped reads are refused in live mode rather than falling back to seed '
-    + 'relationships that do not describe the real org.',
+    'Reporting_To.ID (the manager __recordId) is now observed and indexed by the employee '
+    + 'directory (employeeDirectory.js), but the manager -> direct-reports relationship is NOT yet '
+    + 'used for authorization: team-scoped reads stay refused in live mode until E3 wires it in. '
+    + 'Designation and location are still not mapped, so headcount groups by department only.',
 });

@@ -27,6 +27,27 @@ export const CONFIRMED_ENDPOINTS = {
     confirmedOn: '2026-09-07',
     confirmedParams: ['from_date', 'to_date', 'date_format', 'data_select'],
   },
+  /**
+   * The Booked and Balance report — Zoho's own leave balance, replacing NeuIQ's invented one.
+   *
+   * Confirmed 2026-10-13 against the .com tenant: `from`/`to` in dd-MMM-yyyy (yyyy-MM-dd returned
+   * HTTP 500 — Zoho answers a malformed request with a server error, so this endpoint is never
+   * retried on 5xx), `unit=Day`, and `employee` as a JSON array of erecnos (__recordId), which
+   * Zoho honoured: the report held only the requested employee.
+   *
+   * Documented limit: 30 requests, then a two-minute lockout.
+   */
+  'people.leave.balance': {
+    method: 'GET',
+    path: '/people/api/v2/leavetracker/reports/bookedAndBalance',
+    envelope: 'report',
+    scopeKey: 'people.leave.read',
+    confirmedOn: '2026-10-13',
+    confirmedParams: ['from', 'to', 'unit', 'employee'],
+    dateFormat: 'dd-MMM-yyyy',
+    retryOn5xx: false,
+    rateLimit: { requests: 30, lockoutSeconds: 120 },
+  },
   'people.attendance.entries': {
     method: 'GET',
     path: '/people/api/v3/attendance/entries',
