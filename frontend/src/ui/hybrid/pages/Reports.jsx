@@ -4,6 +4,8 @@ import Icon from '@shared/icons/Icon.jsx';
 import AnalyticsTabs from '../components/AnalyticsTabs.jsx';
 import Widget from '../components/Widget.jsx';
 import { useDashboards } from '@shared/dashboards/useDashboards.js';
+import { errorState } from '@shared/data/emptyStates.js';
+import EmptyPanel from '../components/EmptyPanel.jsx';
 
 /**
  * Reports — the shelf, and a report opens on it.
@@ -128,10 +130,13 @@ export default function Reports() {
           </div>
 
           <div className="neuiq-group-label">
-            Built by you {dash.source === 'sample' && <span className="dw-tag">sample</span>}
+            Built by you
           </div>
           {dash.loading ? (
             <div className="neuiq-list"><div className="neuiq-row"><span className="dw-skel" style={{ height: 16, flex: 1 }} /></div></div>
+          ) : dash.error ? (
+            // Unreachable or refused: never "Nothing saved yet", which would claim there is nothing.
+            <EmptyPanel state={errorState(dash.error)} />
           ) : dash.list.length ? (
             <div className="neuiq-list">
               {dash.list.map((d) => (
@@ -142,7 +147,7 @@ export default function Reports() {
                   <span style={{ flex: 1, minWidth: 0 }}>{d.title}</span>
                   <span className="chip">{d.widgets.length} widget{d.widgets.length === 1 ? '' : 's'}</span>
                   <span style={{ fontSize: 12, color: 'var(--ink-dim)', width: 78, textAlign: 'right' }}>
-                    {d.updatedAt ? new Date(d.updatedAt).toLocaleDateString() : 'local'}
+                    {d.updatedAt ? new Date(d.updatedAt).toLocaleDateString() : '—'}
                   </span>
                 </button>
               ))}

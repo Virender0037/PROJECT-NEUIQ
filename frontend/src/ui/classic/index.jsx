@@ -4,6 +4,7 @@ import { applyTheme } from '@shared/lib/theme.js';
 import './styles/theme.css';
 import Sidebar from './components/Sidebar.jsx';
 import TopControls from './components/TopControls.jsx';
+import DataSourceBanner from './components/DataSourceBanner.jsx';
 import Composer from './components/Composer.jsx';
 import Toasts from './components/Toasts.jsx';
 
@@ -59,6 +60,10 @@ export default function ClassicUI() {
       <Sidebar />
 
       <main style={{ flex: 1, minWidth: 0, height: '100%', display: 'flex', flexDirection: 'column', background: 'var(--app-bg)', position: 'relative' }}>
+        {/* In the flow, above everything: TopControls is absolutely positioned against the
+            wrapper below, so the banner pushes the whole pane down rather than sitting under it. */}
+        <DataSourceBanner />
+        <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', position: 'relative' }}>
         <TopControls />
 
         <div data-nr-scroll="1" style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', position: 'relative', paddingTop: 48 }}>
@@ -81,6 +86,7 @@ export default function ClassicUI() {
 
         {isChatLike && <Composer />}
         <Toasts />
+        </div>
       </main>
 
       {app.landing && <Landing />}

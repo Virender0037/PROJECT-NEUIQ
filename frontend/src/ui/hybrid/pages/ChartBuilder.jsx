@@ -4,7 +4,9 @@ import Icon from '@shared/icons/Icon.jsx';
 import AnalyticsTabs from '../components/AnalyticsTabs.jsx';
 import Widget from '../components/Widget.jsx';
 import { useApi, api } from '@shared/api';
-import { SOURCES, METRICS, CHART_TYPES, schemaFor, sanitize } from '@shared/dashboards';
+import { SOURCES, METRICS, CHART_TYPES, sanitize } from '@shared/dashboards';
+import { actionFailedMessage, errorState } from '@shared/data/emptyStates.js';
+import EmptyPanel from '../components/EmptyPanel.jsx';
 import { useDashboards } from '@shared/dashboards/useDashboards.js';
 
 /**
@@ -53,10 +55,11 @@ export default function ChartBuilder() {
    * as a broken chart rather than as a permission boundary — the user would keep retrying a
    * combination that can never work.
    */
-  const { data: meta } = useApi(
+  // No fallback (Phase 4). An unreachable server used to produce a client-side source list, so
+  // the picker looked loaded with nothing behind it; now the failure is shown as itself.
+  const { data: meta, error: metaError } = useApi(
     (signal) => api.dashboards.meta({ signal }),
     [],
-    { fallback: () => ({ sources: schemaFor({ isAdmin: false }) }) },
   );
   const schema = meta?.sources || [];
 
@@ -91,11 +94,13 @@ export default function ChartBuilder() {
     if (!query || saving) return;
     setSaving(true);
     try {
-      const row = await dash.create({ title: title.trim() || 'Chart', widgets: [widget] });
-      app.pushToast(`Saved to dashboards${row?.local ? ' (offline)' : ''}.`);
+      // create() throws unless the server stored it, so reaching this line means it is saved.
+      await dash.create({ title: title.trim() || 'Chart', widgets: [widget] });
+      app.pushToast('Saved to dashboards.');
       app.go('custom');
     } catch (err) {
-      app.pushToast(err.message || 'Could not save that.');
+      // "Saved to dashboards (offline)." used to appear for a chart held only in memory.
+      app.pushToast(actionFailedMessage(err));
     } finally {
       setSaving(false);
     }
@@ -115,6 +120,7 @@ export default function ChartBuilder() {
         </button>
       }
     >
+      {metaError && <div style={{ marginBottom: 14 }}><EmptyPanel state={errorState(metaError)} /></div>}
       <div className="cb-split">
         <div className="dw-card" style={{ alignSelf: 'start' }}>
           <div className="dw-head">Build</div>

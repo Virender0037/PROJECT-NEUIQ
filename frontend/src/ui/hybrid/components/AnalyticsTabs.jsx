@@ -14,7 +14,7 @@ import Icon from '@shared/icons/Icon.jsx';
 const TABS = [
   { view: 'reports', label: 'Reports', icon: 'activity', hint: 'Every report in the workspace — standard, built by hand, or built by AI' },
   { view: 'builder', label: 'Chart Builder', icon: 'sliders', hint: 'Pick a source, a grouping and a chart type over your people data' },
-  { view: 'custom', label: 'AI Dashboards', icon: 'sparkles', hint: 'Describe a dashboard; it is built from your live data' },
+  { view: 'custom', label: 'AI Dashboards', icon: 'sparkles', hint: 'Describe a dashboard; it is built from the data your account may read' },
 ];
 
 export default function AnalyticsTabs({ active, actions, children }) {

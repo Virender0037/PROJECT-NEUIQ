@@ -5,6 +5,8 @@ import AnalyticsTabs from '../components/AnalyticsTabs.jsx';
 import Widget from '../components/Widget.jsx';
 import { buildDashboard, cleanWidgets, SUGGESTIONS } from '@shared/dashboards';
 import { useDashboards } from '@shared/dashboards/useDashboards.js';
+import { CONNECTION, actionFailedMessage, errorState } from '@shared/data/emptyStates.js';
+import EmptyPanel from '../components/EmptyPanel.jsx';
 
 /**
  * AI Dashboards — describe what you want, the server turns it into a widget spec against the
@@ -14,6 +16,8 @@ import { useDashboards } from '@shared/dashboards/useDashboards.js';
  * rather than being discovered after it is in your list.
  */
 function BuildModal({ open, onClose, onSaved }) {
+  // Provenance from what the backend reports (shared/lib/dataSource.js), never assumed "live".
+  const { dataInfo } = useApp();
   const [prompt, setPrompt] = useState('');
   const [spec, setSpec] = useState(null);
   const [title, setTitle] = useState('');
@@ -36,10 +40,10 @@ function BuildModal({ open, onClose, onSaved }) {
       setSpec(res);
       setTitle(res.title || p.slice(0, 48));
     } catch (err) {
-      // A build that failed for a reason the server gave should say the server's reason. The
-      // generic "couldn't build that" below is for a spec that came back empty, which is a
-      // different problem with a different fix.
-      setFailed(err.message || 'Could not build that dashboard.');
+      // The server's reason — or, with the server unreachable, that it could not be reached.
+      // There is no offline builder any more (Phase 4): it was not scope-aware, and could hand
+      // an employee an admin-only widget to preview.
+      setFailed(actionFailedMessage(err, CONNECTION.buildFailed));
     } finally {
       setBusy(false);
     }
@@ -67,7 +71,7 @@ function BuildModal({ open, onClose, onSaved }) {
         <div className="modal-head">
           <div>
             <h2><Icon name="sparkles" size={18} /> Build a dashboard with AI</h2>
-            <p>Describe what you want to see. It is built from your live Zoho People data.</p>
+            <p>{dataInfo.builds}</p>
           </div>
           <button className="modal-close" aria-label="Close" onClick={onClose}><Icon name="x" size={16} /></button>
         </div>
@@ -110,9 +114,9 @@ function BuildModal({ open, onClose, onSaved }) {
                     is not the model's work, and passing it off as such is how you stop trusting
                     either one. */}
                 <span className="adb-src">
-                  {spec.source === 'sample' ? 'built offline'
-                    : spec.source === 'fallback' ? 'built from keywords'
-                    : 'via ' + spec.source}
+                  {spec.source === 'fallback' ? 'built from keywords'
+                    : spec.source ? 'via ' + spec.source
+                    : 'source not reported'}
                 </span>
               </div>
               <div className="dw-grid">{spec.widgets.map((w, i) => <Widget key={i} widget={w} />)}</div>
@@ -159,7 +163,9 @@ export default function AiDashboards() {
    *  says nothing is indistinguishable from a broken button. */
   const attempt = async (fn, done) => {
     try { const r = await fn(); app.pushToast(done); return r; }
-    catch (err) { app.pushToast(err.message || 'That did not work.'); return null; }
+    // A change the server did not confirm says so. "Dashboard saved." used to appear for edits
+    // held only in browser memory while the API was down.
+    catch (err) { app.pushToast(actionFailedMessage(err)); return null; }
   };
 
   const onSaved = async (spec) => {
@@ -187,8 +193,6 @@ export default function AiDashboards() {
       active="custom"
       actions={
         <>
-          {/* The list came from the seeds, not from the server. Say so where it is read. */}
-          {dash.source === 'sample' && <span className="dw-tag">sample</span>}
           <button className="btn primary" onClick={() => setBuildOpen(true)}>
             <Icon name="sparkles" size={15} />New with AI
           </button>
@@ -241,6 +245,9 @@ export default function AiDashboards() {
 
       {dash.loading ? (
         <div className="dw-grid">{[0, 1, 2].map((i) => <div className="dw-card" key={i}><div className="dw-skel" /></div>)}</div>
+      ) : dash.error ? (
+        // Unreachable or refused: never "No dashboards yet", which would claim there are none.
+        <EmptyPanel state={errorState(dash.error)} />
       ) : active ? (
         <div className="dw-grid">{active.widgets.map((w, i) => <Widget key={i} widget={w} />)}</div>
       ) : (

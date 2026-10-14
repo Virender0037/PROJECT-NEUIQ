@@ -41,9 +41,12 @@ export default function Auth() {
    * A demo you have to be told the usernames for is a demo nobody explores, so "alex@neuiq.com"
    * and "alex" both work. The picker below fills this in, which is why the field is controlled.
    */
+  // What the backend's auth mode allows (shared/lib/authMode.js): the form and the picker are
+  // demo-only, and exist on screen only when the backend explicitly said 'demo'.
+  const opts = app.signInOptions;
   const submit = (e) => {
     e.preventDefault();
-    app.doAuth(email.split('@')[0] || 'alex');
+    if (opts.allowDemo) app.doAuth(email.split('@')[0] || 'alex');
   };
 
   return (
@@ -61,11 +64,20 @@ export default function Auth() {
           </p>
         </div>
 
+        {/* Demo sign-in — this form, the picker and the signup toggle — exists only when the
+            backend explicitly reported demo mode. Otherwise the screen offers nothing it cannot
+            honour. */}
+        {!opts.allowDemo && (
+          <div className="card" role="status" style={{ textAlign: 'center', fontSize: 13.5, color: 'var(--ink-2)', lineHeight: 1.5 }}>
+            {opts.message}
+          </div>
+        )}
+        {opts.allowDemo && (
         <form className="card" onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
           {signup && (
             <label style={{ display: 'block' }}>
               <span style={{ display: 'block', fontSize: 12.5, fontWeight: 600, marginBottom: 6 }}>Full name</span>
-              <input style={field} type="text" placeholder="Alex Mathew" autoComplete="name" />
+              <input style={field} type="text" placeholder="Your name" autoComplete="name" />
             </label>
           )}
           <label style={{ display: 'block' }}>
@@ -75,7 +87,7 @@ export default function Auth() {
               type="text"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              placeholder="alex@neuiq.com"
+              placeholder="you@company.com"
               autoComplete="email"
             />
           </label>
@@ -100,19 +112,27 @@ export default function Auth() {
             {app.authBusy ? 'Signing in…' : signup ? 'Create account' : 'Sign in'}
           </button>
 
+        </form>
+        )}
+        {/* Zoho sign-in is not built yet, so the control is disabled and says so — never a fake
+            success. It used to sit inside the demo form and toast "Coming soon". */}
+        {opts.showZoho && (
           <button
             type="button"
             className="btn ghost"
-            onClick={app.toast}
-            style={{ justifyContent: 'center' }}
+            disabled={!opts.zoho.enabled}
+            aria-disabled={!opts.zoho.enabled}
+            title={opts.zoho.note || undefined}
+            style={{ justifyContent: 'center', width: '100%', marginTop: 12, opacity: opts.zoho.enabled ? 1 : 0.7, cursor: opts.zoho.enabled ? 'pointer' : 'not-allowed' }}
           >
-            <Icon name="user" size={16} />Continue with Zoho
+            <Icon name="user" size={16} />{opts.zoho.label}
+            {opts.zoho.note && <span className="chip" style={{ marginLeft: 6 }}>{opts.zoho.note}</span>}
           </button>
-        </form>
+        )}
 
-        {/* Only rendered when the API answered. With the backend down there are no accounts to
-            offer, and an empty picker would read as a loading bug. */}
-        {app.demoUsers.length > 0 && (
+        {/* Demo mode only, and only once the API answered with accounts — an empty picker would
+            read as a loading bug. */}
+        {opts.allowDemo && app.demoUsers.length > 0 && (
           <div className="card" style={{ marginTop: 14 }}>
             <div style={{ fontSize: 11.5, fontWeight: 650, color: 'var(--ink-2)', marginBottom: 9 }}>
               Demo accounts — each sees different data
@@ -135,15 +155,17 @@ export default function Auth() {
           </div>
         )}
 
-        <div style={{ textAlign: 'center', marginTop: 18, fontSize: 13.5, color: 'var(--ink-2)' }}>
-          {signup ? 'Already have an account?' : 'No account yet?'}{' '}
-          <button
-            onClick={app.toggleAuthView}
-            style={{ border: 'none', background: 'none', color: 'var(--accent)', cursor: 'pointer', fontWeight: 650, fontSize: 13.5, fontFamily: 'inherit' }}
-          >
-            {signup ? 'Sign in' : 'Create one'}
-          </button>
-        </div>
+        {opts.allowDemo && (
+          <div style={{ textAlign: 'center', marginTop: 18, fontSize: 13.5, color: 'var(--ink-2)' }}>
+            {signup ? 'Already have an account?' : 'No account yet?'}{' '}
+            <button
+              onClick={app.toggleAuthView}
+              style={{ border: 'none', background: 'none', color: 'var(--accent)', cursor: 'pointer', fontWeight: 650, fontSize: 13.5, fontFamily: 'inherit' }}
+            >
+              {signup ? 'Sign in' : 'Create one'}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

@@ -2,7 +2,9 @@ import { useApp } from '@shared/context/AppContext.jsx';
 import El from '@shared/components/El.jsx';
 import Icon from '@shared/icons/Icon.jsx';
 import Logo from '@shared/icons/Logo.jsx';
-import { SIDE_PROJECTS, PINNED, HISTORY_GROUPS } from '@shared/data/mockData.js';
+import { EMPTY } from '@shared/data/emptyStates.js';
+import { profileFor } from '@shared/lib/profile.js';
+import EmptyPanel from './EmptyPanel.jsx';
 
 const NAV = [
   ['dashboard', 'Dashboard', 'layoutGrid'],
@@ -27,7 +29,8 @@ const NAV = [
  */
 export default function Sidebar() {
   const app = useApp();
-  const { collapsed, incognito, rowMenu } = app;
+  const { collapsed, incognito } = app;
+  const me = profileFor(app.user);
   const expanded = !collapsed;
   const ncJustify = collapsed ? 'center' : 'flex-start';
   const sbw = collapsed ? '72px' : app.sidebarWidth + 'px';
@@ -86,38 +89,13 @@ export default function Sidebar() {
 
         {expanded && (
           <div>
-            {/* projects list */}
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 10px 4px' }}>
-              <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-subtle)' }}>Projects</span>
-              <El as="button" onClick={() => app.go('projects')}
-                css="width:22px;height:22px;border:none;background:transparent;color:var(--text-subtle);border-radius:6px;cursor:pointer;display:flex;align-items:center;justify-content:center"
-                hover="background:var(--hover);color:var(--text)"><Icon name="plus" size={14} /></El>
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-              {SIDE_PROJECTS.map((name) => (
-                <El key={name} as="button" onClick={() => app.go('project')}
-                  css="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border:none;background:transparent;border-radius:8px;cursor:pointer;color:var(--text-muted);font-family:'Inter Tight';font-size:13.5px;text-align:left;width:100%"
-                  hover="background:var(--hover);color:var(--text)">
-                  <span style={{ width: 20, height: 20, borderRadius: 6, background: 'var(--surface-2)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-subtle)', flex: '0 0 auto' }}><Icon name="folder" size={14} /></span>
-                  <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
-                </El>
-              ))}
-            </div>
+            {/* Projects, pinned chats and chat history used to be invented lists (mockData), each
+                opening the same canned transcript, and history rows offered Share / Export menus that
+                toasted "Share link copied" and "Exporting chat…" without doing either. None of those
+                features has a source yet, so each section says so. Navigation above is unchanged. */}
+            <div style={{ padding: '12px 10px 4px' }}><span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-subtle)' }}>Projects</span></div>
+            <EmptyPanel state={EMPTY.sidebarProjects} compact />
 
-            {/* pinned */}
-            <div style={{ padding: '12px 10px 4px' }}><span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-subtle)' }}>Pinned</span></div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-              {PINNED.map((name) => (
-                <El key={name} as="button" onClick={app.loadConvo}
-                  css="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border:none;background:transparent;border-radius:8px;cursor:pointer;color:var(--text-muted);font-family:'Inter Tight';font-size:13.5px;text-align:left;width:100%"
-                  hover="background:var(--hover);color:var(--text)">
-                  <span style={{ color: 'var(--text-subtle)', flex: '0 0 auto', display: 'flex' }}><Icon name="star" size={14} filled /></span>
-                  <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
-                </El>
-              ))}
-            </div>
-
-            {/* history */}
             {incognito ? (
               <div style={{ margin: '16px 6px 6px', padding: '16px 14px', border: 'var(--border-w) dashed var(--border-strong)', borderRadius: 12, textAlign: 'center', color: 'var(--text-subtle)' }}>
                 <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 8, color: 'var(--text-muted)' }}><Icon name="lock" size={20} /></div>
@@ -125,48 +103,13 @@ export default function Sidebar() {
               </div>
             ) : (
               <div>
-                {HISTORY_GROUPS.map((grp) => (
-                  <div key={grp.label}>
-                    <div style={{ padding: '12px 10px 4px' }}><span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-subtle)' }}>{grp.label}</span></div>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-                      {grp.items.map((title, i) => {
-                        const key = grp.label + '|' + i;
-                        const open = rowMenu === key;
-                        return (
-                          <div key={key} className="nr-row">
-                            <El as="button" onClick={app.loadConvo}
-                              css="display:flex;align-items:center;gap:11px;height:30px;padding:0 30px 0 11px;border:none;background:transparent;border-radius:8px;cursor:pointer;color:var(--text-muted);font-family:'Inter Tight';font-size:13.5px;text-align:left;width:100%"
-                              hover="background:var(--hover);color:var(--text)">
-                              <span style={{ width: 5, height: 5, borderRadius: 999, border: '1.5px solid var(--text-subtle)', flex: '0 0 auto', boxSizing: 'border-box' }} />
-                              <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{title}</span>
-                            </El>
-                            <El as="button" className="nr-row-more" data-open={open ? '1' : '0'} title="More"
-                              onClick={(e) => { e.stopPropagation(); app.openRowMenu(key); }}
-                              css="position:absolute;right:5px;top:50%;transform:translateY(-50%);width:23px;height:23px;border:none;background:transparent;color:var(--text-subtle);border-radius:6px;cursor:pointer;display:flex;align-items:center;justify-content:center"
-                              hover="background:var(--active);color:var(--text)"><Icon name="more" size={16} /></El>
-                            {open && (
-                              <div style={{ position: 'absolute', right: 5, top: 29, zIndex: 40, minWidth: 158, background: 'var(--elevated)', border: 'var(--border-w) solid var(--border-strong)', borderRadius: 10, boxShadow: 'var(--sh-lg)', padding: 5, display: 'flex', flexDirection: 'column', gap: 1, animation: 'nrPop .16s ease-out' }}>
-                                <RowMenuItem icon="share" label="Share" onClick={(e) => { e.stopPropagation(); app.closeRowMenu(); app.pushToast('Share link copied'); }} />
-                                <RowMenuItem icon="download" label="Export" onClick={(e) => { e.stopPropagation(); app.closeRowMenu(); app.pushToast('Exporting chat…'); }} />
-                                <div style={{ height: 1, background: 'var(--border)', margin: '3px 6px' }} />
-                                <RowMenuItem icon="eyeOff" label="Private chat" onClick={(e) => { e.stopPropagation(); app.closeRowMenu(); app.toggleIncognito(); }} />
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                ))}
+                <div style={{ padding: '12px 10px 4px' }}><span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-subtle)' }}>Chats</span></div>
+                <EmptyPanel state={EMPTY.sidebarHistory} compact />
               </div>
             )}
           </div>
         )}
       </div>
-
-      {rowMenu !== null && (
-        <div onClick={app.closeRowMenu} style={{ position: 'fixed', inset: 0, zIndex: 35 }} />
-      )}
 
       {/* bottom: search + profile */}
       <div style={{ flex: '0 0 auto', padding: '8px 12px 12px', borderTop: 'var(--border-w) solid var(--border)', display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -182,11 +125,15 @@ export default function Sidebar() {
           <El as="button" onClick={() => app.go('settings')}
             css={`flex:1;min-width:0;display:flex;align-items:center;gap:10px;padding:6px;border:none;background:transparent;border-radius:10px;cursor:pointer;text-align:left;justify-content:${ncJustify}`}
             hover="background:var(--hover)">
-            <span style={{ width: 32, height: 32, borderRadius: 999, background: 'var(--surface-2)', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 600, fontSize: 13, flex: '0 0 auto', fontFamily: 'Geist' }}>AM</span>
+            {/* The authenticated user (shared/lib/profile.js). This used to read "Alex Morgan ·
+                Pro plan" for every account; there is no plan, and the name was nobody's. */}
+            <span aria-hidden="true" style={{ width: 32, height: 32, borderRadius: 999, background: 'var(--surface-2)', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 600, fontSize: 13, flex: '0 0 auto', fontFamily: 'Geist' }}>
+              {me.initials || <Icon name="user" size={16} />}
+            </span>
             {expanded && (
               <span style={{ flex: 1, overflow: 'hidden' }}>
-                <span style={{ display: 'block', fontSize: 13.5, fontWeight: 600, color: 'var(--text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>Alex Morgan</span>
-                <span style={{ display: 'block', fontSize: 11.5, color: 'var(--text-subtle)' }}>Pro plan</span>
+                <span style={{ display: 'block', fontSize: 13.5, fontWeight: 600, color: 'var(--text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{me.name}</span>
+                <span style={{ display: 'block', fontSize: 11.5, color: 'var(--text-subtle)' }}>{me.role}</span>
               </span>
             )}
           </El>
@@ -202,13 +149,5 @@ export default function Sidebar() {
         <div onMouseDown={app.startResize} title="Drag to resize" style={{ position: 'absolute', top: 0, right: -3, width: 7, height: '100%', cursor: 'col-resize', zIndex: 20 }} />
       )}
     </aside>
-  );
-}
-
-function RowMenuItem({ icon, label, onClick }) {
-  return (
-    <El as="button" onClick={onClick}
-      css="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border:none;background:transparent;border-radius:7px;cursor:pointer;color:var(--text);font-family:'Inter Tight';font-size:13px;text-align:left;width:100%"
-      hover="background:var(--hover)"><Icon name={icon} size={16} />{label}</El>
   );
 }

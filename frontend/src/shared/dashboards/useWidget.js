@@ -11,7 +11,7 @@
  * should look different.
  */
 import { useApi, api } from '../api/index.js';
-import { resolveQuery, SAMPLE_KPIS } from './index.js';
+import { resolveQuery } from './index.js';
 
 /**
  * The headline numbers a kpi tile shows.
@@ -21,11 +21,10 @@ import { resolveQuery, SAMPLE_KPIS } from './index.js';
  * dashboard, different numbers — which is exactly why a widget cannot store its value.
  */
 export function useKpis() {
-  return useApi(
-    (signal) => api.analyticsSummary({ signal }),
-    [],
-    { fallback: () => ({ kpis: SAMPLE_KPIS }) },
-  );
+  // No fallback. These used to become SAMPLE_KPIS ("Headcount 105", "Pending approvals 12") when
+  // the server was unreachable — shown to an employee who may not see headcount at all. A failure
+  // now reaches the tile as an error: unavailable, or not permitted.
+  return useApi((signal) => api.analyticsSummary({ signal }), []);
 }
 
 /**
@@ -34,9 +33,9 @@ export function useKpis() {
  * The query is the dependency, serialized — a tile whose spec is edited in the chart builder
  * re-resolves, and one merely re-rendered by its parent does not.
  *
- * No `fallback` on purpose. `resolveQuery` already substitutes sample rows when the server is
- * unreachable and reports `source: 'sample'` for it; a second fallback here would swallow the
- * 403 that says "you may not read this source", and that refusal must reach the screen.
+ * Failures pass straight through: `resolveQuery` throws for an unreachable server and for a 403
+ * alike, so the tile can say "unavailable" or "not permitted" — and the refusal that says "you
+ * may not read this source" always reaches the screen.
  */
 export function useWidgetRows(widget) {
   const key = JSON.stringify(widget?.query || null);

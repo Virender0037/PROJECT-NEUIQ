@@ -1,5 +1,5 @@
 import { useApp } from '@shared/context/AppContext.jsx';
-import { UserMessage, AiMessage, ThinkingPill, StreamingMessage } from '../components/ChatMessage.jsx';
+import { UserMessage, AiMessage, ChatNotice, ThinkingPill, StreamingMessage } from '../components/ChatMessage.jsx';
 
 /**
  * Conversation — the message list.
@@ -15,7 +15,9 @@ export default function Conversation() {
       {app.messages.map(m => (
         m.role === 'user'
           ? <UserMessage key={m.id} text={m.text} />
-          : <AiMessage key={m.id} blocks={m.blocks} meta={m.meta} />
+          : m.role === 'notice'
+            ? <ChatNotice key={m.id} notice={m} />
+            : <AiMessage key={m.id} blocks={m.blocks} meta={m.meta} />
       ))}
       {app.thinking && <ThinkingPill />}
       {app.streaming && !app.thinking && app.streamText && <StreamingMessage text={app.streamText} />}

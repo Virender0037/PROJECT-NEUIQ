@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "node test/dashboards.check.mjs"
+    "check": "node test/dashboards.check.mjs && node test/ui.check.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

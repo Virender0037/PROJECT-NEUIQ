@@ -1,5 +1,6 @@
 import { LineChart, PieChart, BarChart, fmt } from '@shared/components/charts.jsx';
 import { useKpis, useWidgetRows } from '@shared/dashboards/useWidget.js';
+import { errorState } from '@shared/data/emptyStates.js';
 
 /**
  * Widget — Classic's card around a widget spec.
@@ -55,36 +56,28 @@ const Skeleton = ({ title, span }) => (
  * is opened by an employee, and "you may not see this" is the honest answer. Sample numbers in
  * its place would misrepresent someone's access.
  */
-const Failed = ({ title, span, error }) => (
-  <Card title={title} span={span}>
-    <Note>{error?.status === 403 ? 'Not available on your account.' : error?.message || 'Could not load this widget.'}</Note>
-  </Card>
-);
+const Failed = ({ title, span, error }) => {
+  // Shared wording (shared/data/emptyStates.js) so Classic and Hybrid classify a failure alike:
+  // a 403 is "not permitted", an unreachable server is "API unavailable" — never a zero, never
+  // sample figures. (Offline sample tiles, with their SAMPLE tag, were removed in Phase 4.)
+  const s = errorState(error);
+  return (
+    <Card title={title} span={span}>
+      <div role="status" data-state-kind={s.kind}>
+        <Note>{s.title}{s.body ? ` ${s.body}` : ''}</Note>
+      </div>
+    </Card>
+  );
+};
 
-/** The "these are not real figures" marker, shown only when the API could not be reached. */
-const SampleTag = () => (
-  <span
-    title="The API is unreachable — showing sample figures"
-    style={{
-      padding: '1px 6px', borderRadius: 999, border: '1px solid var(--amber)', color: 'var(--amber)',
-      fontSize: 10, fontWeight: 700, letterSpacing: '.04em', textTransform: 'uppercase',
-    }}
-  >sample</span>
-);
-
-const head = (title, source) => (
-  <>
-    <span style={{ flex: 1, minWidth: 0 }}>{title}</span>
-    {source === 'sample' && <SampleTag />}
-  </>
-);
+const head = (title) => <span style={{ flex: 1, minWidth: 0 }}>{title}</span>;
 
 function KpiWidget({ title }) {
-  const { data, loading, error, source } = useKpis();
+  const { data, loading, error } = useKpis();
   if (loading) return <Skeleton title={title} span={3} />;
   if (error) return <Failed title={title} span={3} error={error} />;
   return (
-    <Card title={head(title, source)} span={3}>
+    <Card title={head(title)} span={3}>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: 16 }}>
         {data.kpis.map((k) => (
           <div key={k.name}>
@@ -98,14 +91,14 @@ function KpiWidget({ title }) {
 }
 
 function QueryWidget({ widget, title }) {
-  const { rows, loading, error, source } = useWidgetRows(widget);
+  const { rows, loading, error } = useWidgetRows(widget);
   // A pie needs its legend beside it and a table needs width; a bar list is happy narrow.
   const span = widget.type === 'pie' || widget.type === 'donut' || widget.type === 'table' ? 2 : 1;
 
   if (loading) return <Skeleton title={title} span={span} />;
   if (error) return <Failed title={title} span={span} error={error} />;
 
-  const h = head(title, source);
+  const h = head(title);
   if (!rows.length) return <Card title={h} span={span}><Note>No data.</Note></Card>;
 
   if (widget.type === 'table') {

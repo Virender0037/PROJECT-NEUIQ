@@ -2,7 +2,9 @@ import { useApp } from '@shared/context/AppContext.jsx';
 import El from '@shared/components/El.jsx';
 import Icon from '@shared/icons/Icon.jsx';
 import { useApi, api } from '@shared/api';
-import { SOURCES, schemaFor } from '@shared/dashboards';
+import { SOURCES } from '@shared/dashboards';
+import { errorState } from '@shared/data/emptyStates.js';
+import EmptyPanel from '../components/EmptyPanel.jsx';
 
 /**
  * AI — what the assistant can actually do, stated plainly.
@@ -69,11 +71,9 @@ export default function Ai() {
    * the source registry at the narrower role — enough to demo, and labelled so it is not
    * mistaken for the server's answer about this account.
    */
-  const { data, loading, source } = useApi(
-    (signal) => api.capabilities({ signal }),
-    [],
-    { fallback: () => ({ model: null, routing: 'keywords only', readOnly: true, tools: [], sources: schemaFor({ isAdmin: false }) }) },
-  );
+  // No fallback (Phase 4): an unreachable server used to produce a client-side capability list,
+  // labelled "sample". Now the page says the API is unavailable and lists nothing it was not told.
+  const { data, loading, error } = useApi((signal) => api.capabilities({ signal }), []);
 
   const tools = [...(data?.tools || []), BUILDER_CARD];
   const schema = data?.sources || [];
@@ -82,14 +82,13 @@ export default function Ai() {
     <div style={{ maxWidth: 1000, margin: '0 auto', padding: '6px 26px 40px' }}>
       <h2 style={{ fontFamily: 'Geist', fontSize: 20, fontWeight: 600, letterSpacing: '-.01em', margin: '0 0 4px', display: 'flex', alignItems: 'center', gap: 9 }}>
         AI
-        {source === 'sample' && (
-          <span style={{ fontSize: 11, color: 'var(--amber)', fontWeight: 600, letterSpacing: 0 }}>sample</span>
-        )}
       </h2>
       <p style={{ fontSize: 13.5, color: 'var(--text-subtle)', margin: '0 0 4px' }}>
         What the assistant can reach, and what it will not do.
         {data && <> Routing: <strong style={{ color: 'var(--text-muted)' }}>{data.routing}</strong>{data.readOnly && ' · read-only'}.</>}
       </p>
+
+      {error && <div style={{ margin: '12px 0' }}><EmptyPanel state={errorState(error)} /></div>}
 
       <Label>Try asking</Label>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>

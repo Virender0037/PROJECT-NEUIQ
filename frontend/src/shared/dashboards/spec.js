@@ -126,11 +126,14 @@ export function cleanWidgets(widgets) {
     .filter(Boolean);
 }
 
-// ===== the offline stand-ins =====
+// ===== test fixtures — NOT used at runtime =====
 //
-// Sample rows and the keyword builder. They live beside the contract, not beside the network
-// layer, because they are pure functions over the same whitelist — and because the whitelist
-// test needs to reach them without a bundler.
+// Sample rows and a keyword builder. They used to be the app's offline fallbacks; Phase 4 removed
+// every runtime call to them, because a sample chart is still invented HR data. They stay here
+// ONLY because test/dashboards.check.mjs exercises them against the whitelist under plain node,
+// and test/ui.check.mjs fails if any runtime file references them again.
+//
+// Do not import these from a screen, a hook or the API layer.
 
 export const SUGGESTIONS = [
   'Leave taken by type this year, and the headline numbers',

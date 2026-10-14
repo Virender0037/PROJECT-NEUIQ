@@ -67,26 +67,42 @@ function Block({ b }) {
  *
  * This is not decoration. Every number here is somebody's leave or hours, and the first
  * question anyone asks of such a number is "is that actually from Zoho?". The tool name
- * answers it; `sample` answers it in the other direction.
+ * answers it. (The `sample` pill that marked canned offline answers went with them in Phase 4.)
  */
 export function AnswerMeta({ meta }) {
   if (!meta) return null;
   const bits = [];
   if (meta.tool) bits.push(meta.tool);
-  if (meta.source && meta.source !== 'sample' && meta.source !== 'guard') bits.push('routed by ' + meta.source);
+  if (meta.source && meta.source !== 'guard') bits.push('routed by ' + meta.source);
   if (meta.outcome === 'refused') bits.push('refused');
   if (meta.outcome === 'stopped') bits.push('stopped');
-  if (!bits.length && meta.source !== 'sample') return null;
+  if (!bits.length) return null;
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6, fontSize: 11.5, color: 'var(--text-subtle)' }}>
-      {meta.source === 'sample' && (
-        <span style={{
-          padding: '1px 6px', borderRadius: 999, border: '1px solid var(--amber, var(--text-subtle))',
-          color: 'var(--amber, var(--text-subtle))', fontSize: 10, fontWeight: 700,
-          letterSpacing: '.04em', textTransform: 'uppercase',
-        }}>sample</span>
+      <code style={{ fontSize: 11.5 }}>{bits.join(' · ')}</code>
+    </div>
+  );
+}
+
+/**
+ * A question that could not be sent — NOT an assistant reply.
+ *
+ * Rendered without the assistant's avatar or its copy / like / pin actions, because nothing was
+ * answered. It replaced a canned reply typed out as if the assistant had spoken. Retry takes the
+ * failed attempt back out and sends the question again.
+ */
+export function ChatNotice({ notice }) {
+  const app = useApp();
+  return (
+    <div role="alert" data-notice-kind={notice.kind}
+      style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', border: 'var(--border-w) dashed var(--border-strong)', borderRadius: 12, background: 'var(--surface)', color: 'var(--text-muted)', fontSize: 13.5 }}>
+      <Icon name="help" size={16} />
+      <span style={{ flex: 1, minWidth: 0 }}>{notice.text}</span>
+      {notice.retryText && (
+        <El as="button" onClick={() => app.retryMessage(notice)}
+          css="display:flex;align-items:center;gap:6px;height:30px;padding:0 11px;border:var(--border-w) solid var(--border-strong);background:var(--surface);color:var(--text);border-radius:8px;cursor:pointer;font-size:12.5px;font-weight:600;font-family:'Inter Tight'"
+          hover="background:var(--hover)"><Icon name="refresh" size={14} />Retry</El>
       )}
-      {bits.length > 0 && <code style={{ fontSize: 11.5 }}>{bits.join(' · ')}</code>}
     </div>
   );
 }

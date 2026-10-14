@@ -65,7 +65,8 @@ export default function Composer() {
           </div>
         </div>
         <div style={{ textAlign: 'center', fontSize: 11.5, color: 'var(--ink-dim)', marginTop: 8 }}>
-          NeuIQ answers from live Zoho People data. Verify anything you act on.
+          {/* From what the backend reports — "live" only when it said 'zoho'. */}
+          {app.dataInfo.answers}
         </div>
       </div>
     </div>
