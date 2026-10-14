@@ -83,7 +83,8 @@ export function buildLiveSources({ client, now = () => new Date() }) {
       ...PEOPLE_SOURCES.employees,
       rows: undefined,
       async fetchRows({ user, signal }) {
-        // Throws until ZOHO_PEOPLE_FORMS_RESULT_PATH is set — see transformers/envelope.js.
+        // Every page or a throw (people/client.js) — a failed walk is never cached (cache.wrap
+        // keeps no rejection), so the next request walks again instead of serving a partial list.
         return cached(user, ['employees'], async () => {
           const raw = await client.employees({ signal });
           return transformEmployeeRecords(raw);

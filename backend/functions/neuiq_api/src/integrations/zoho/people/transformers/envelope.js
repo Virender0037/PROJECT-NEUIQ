@@ -189,3 +189,60 @@ export function unwrapForms(payload, path = FORMS_RESULT_PATH) {
 
   return flattenKeyedRecords(node);
 }
+
+// ---------------------------------------------------------------- forms pages
+
+/**
+ * The one forms error that may mean "no more records" — exactly as observed, nothing looser.
+ *
+ * Recorded 2026-10-14 against the .com test organisation, `getRecords?sIndex=3&limit=1` on a
+ * two-employee directory, directly after a FULL page (`sIndex=2&limit=1` returned one record):
+ *
+ *   HTTP 200
+ *   { "response": { "message": "Error occurred", "uri": "…",
+ *                   "errors": { "code": 7024, "message": "No records found" }, "status": 1 } }
+ *
+ * 7024 is Zoho's generic "No records found" (error-code reference), not a documented end-of-list
+ * signal, so this shape only ever ENDS a pagination that is in a position to end — the caller
+ * decides that, not this function. Neither message text is checked: like `unwrapV3`, nothing here
+ * treats `message` as a signal.
+ */
+export const FORMS_NO_RECORDS_CODE = 7024;
+
+/**
+ * Classify ONE `getRecords` page:
+ *
+ *   { kind: 'rows', rows }   status 0 with a `result` array — rows flattened by `unwrapForms`
+ *   { kind: 'noRecords' }    exactly the observed 7024 shape above, and nothing else
+ *
+ * Everything else throws EnvelopeError — another error code, a 7024 that also carries a result,
+ * an `errors` array, a string code, a missing or unknown status. `unwrapForms` is deliberately
+ * left as it was: this is a narrower reader for paging, not a loosening of that one.
+ */
+export function classifyFormsPage(payload) {
+  const response = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload.response : undefined;
+  if (!response || typeof response !== 'object' || Array.isArray(response)) {
+    throw new EnvelopeError('forms page: no response object', { payload });
+  }
+
+  if (response.status === 0) {
+    if (!Array.isArray(response.result)) {
+      throw new EnvelopeError('forms page: status 0 without a result array', { payload: response });
+    }
+    if (response.errors !== undefined) {
+      throw new EnvelopeError('forms page: status 0 carrying errors', { payload: response });
+    }
+    return { kind: 'rows', rows: unwrapForms(payload).rows };
+  }
+
+  if (response.status === 1) {
+    const errors = response.errors;
+    const exactNoRecords = !('result' in response)
+      && errors && typeof errors === 'object' && !Array.isArray(errors)
+      && errors.code === FORMS_NO_RECORDS_CODE;
+    if (exactNoRecords) return { kind: 'noRecords' };
+    throw new EnvelopeError('forms page: Zoho reported an error', { payload: response });
+  }
+
+  throw new EnvelopeError('forms page: unrecognised status', { payload: response });
+}

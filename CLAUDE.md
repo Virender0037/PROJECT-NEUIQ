@@ -89,7 +89,7 @@ Run this checklist every time, in order:
 5. **Make the smallest safe change.** Match the surrounding idiom — comment density, naming,
    error shapes.
 6. **Run the relevant tests.** `npm run check` from the root, or the individual suite.
-7. **Verify no regressions.** Both suites must stay green at their full counts (113 + 284 + 27 + 61). A test
+7. **Verify no regressions.** Both suites must stay green at their full counts (113 + 303 + 27 + 61). A test
    that starts passing for a new reason is as much a regression as one that fails.
 8. **Update documentation if behaviour changed.** The docs in `docs/` are the specification; if
    you change what the code does, say so there and here.
@@ -207,7 +207,7 @@ PROJECT-NEUIQ/
 ```bash
 npm run install:all      # backend + frontend (frontend uses --legacy-peer-deps)
 npm run dev              # API on :4200, UI on :5174 — Ctrl-C stops both
-npm run check            # 113 backend + 284 zoho + 27 contract + 61 UI assertions
+npm run check            # 113 backend + 303 zoho + 27 contract + 61 UI assertions
 npm run build            # frontend production build
 ```
 
@@ -238,7 +238,7 @@ Add `?ui=hybrid` to the URL to open a specific layout; the choice is remembered.
 | `npm run build` | root | Frontend production build |
 | `npm run dev` | backend | `node --env-file-if-exists=.env --watch server.js` on :4200. Loads `backend/.env` natively (Node ≥22.9); a missing file is fine. `npm start` does **not** load it |
 | `npm start` | backend | `node server.js` |
-| `npm run check` | backend | `node tests/check.mjs && node tests/zoho.check.mjs` — 113 + 284 assertions, exit 1 on failure |
+| `npm run check` | backend | `node tests/check.mjs && node tests/zoho.check.mjs` — 113 + 303 assertions, exit 1 on failure |
 | `npm run dev` | frontend | Vite on :5174 (pinned; 5173 belongs to a sibling project) |
 | `npm run check` | frontend | `node test/dashboards.check.mjs && node test/ui.check.mjs` — 27 + 61 assertions |
 | `npm run preview` | frontend | Preview the production build |
@@ -296,7 +296,7 @@ Phase 5.1 was a read-only review of secure Zoho sign-in. Its eight steps, and wh
 | Step | What | Status (verified against code and tests) |
 | --- | --- | --- |
 | **E1** (Phase 5.2) | Auth mode and demo containment | **Done** — `core/auth/mode.js`, `app.js`; 10 auth-mode checks in `tests/check.mjs` + the Phase 5.2 block in `frontend/test/ui.check.mjs` |
-| **E2** (Phase 5.3) | Live employee identity directory | **Done, connected to nothing** — `people/employeeDirectory.js`, `transformers/employeeIdentity.js`; 17 directory/identity checks in `tests/zoho.check.mjs`. Never run against live data. **No pagination** of `getRecords` yet — needed before any organisation larger than one page |
+| **E2** (Phase 5.3) | Live employee identity directory | **Done, connected to nothing** — `people/employeeDirectory.js`, `transformers/employeeIdentity.js`; 17 directory/identity checks in `tests/zoho.check.mjs`. Validated read-only against the 2-employee `.com` test organisation (2026-10-14): ids exact, ZUID/EmployeeID separate, `Reporting_To.ID` = the manager's `__recordId`, guessed ids refused. **E2.1:** `getRecords` is now paged (see *Employee pagination*); paging beyond 200 live employees is unverified |
 | **E3** | Role derivation (`deriveRole`, HR-admin list) and live hierarchy from `Reporting_To.ID` | Not started — needs the HR-admin list decision |
 | **E4** | Server-side session layer (cookies, expiry, logout, CSRF origin check) | Not started — tokens are still bearer tokens in `localStorage` |
 | **E5** | Zoho OIDC (`/auth/zoho/start`, `/auth/zoho/callback`; PKCE, state, nonce) mapped through E2 | Not started — needs a separate Zoho **login** client |
@@ -494,8 +494,59 @@ roles and team scope E3; the Phase 5.2 gate still refuses every token in zoho mo
   cool-down before retrying. Concurrent refreshes share one request.
 - Logs carry counts and codes only. The live `directory` (sync interface) no longer spreads the seed
   directory: every identity method refuses (`resolve` → null, `count` → null).
-- Known gap: `getRecords` is fetched once with no `sIndex`/`limit` paging, so an organisation
-  larger than one page would leave employees `NOT_LINKED` (fails closed, but locks them out).
+
+### Employee pagination (E2.1, 2026-10-14)
+
+`people/client.js` `employees()` reads **every** page or throws — never a shorter list. All callers
+(the E2 directory, the live `employees` query source, live `headcount` and `employeeLookup`) get the
+full directory through it; before E2.1 they all silently saw one page.
+
+**Verified live** (`.com` test organisation, 2 employees, 3 requests — `endpoints.js`): `sIndex` is
+1-based and honoured; `limit` is honoured; `sIndex=2` returns a different record; reading past the
+end returns HTTP 200, `status: 1`, `errors: {code: 7024, message: "No records found"}`, **no
+`result`**. `limit` ≤ 200 is documented, not observed.
+
+**How the walk ends** (`sIndex = 1, 201, 401, …`, `limit = 200`, one page at a time):
+
+| Page reply | Outcome |
+| --- | --- |
+| `status: 0`, `result` with 1–199 records | last page — **done** |
+| `status: 0`, `result` with exactly 200 records | read the next page |
+| the exact 7024 shape above, directly after a full page | **done** |
+| the exact 7024 shape above, on the **first** page | **reject** (`PAGINATION_NO_RECORDS_ON_FIRST_PAGE`) — no empty organisation has been observed, and "No records found" before any page could be a scope or form problem; the directory is `UNAVAILABLE`, not empty |
+| anything else — another code, a 7024 look-alike (result present, `status: 0`, `errors` array, string code), a 7024 with an HTTP error status, malformed JSON, `status: 0` with no records, > 200 records | **reject** |
+| a `__recordId` seen before, a page identical to the previous one | **reject** |
+| > 50 full pages, > 10,000 records, > 60 s for the whole walk | **reject** |
+
+A rejection discards everything collected; the directory then answers `UNAVAILABLE` (its existing
+rule — no stale snapshot, no partial one). 5xx and 429 are **not** retried for pages; a 429 locks the
+page limiter (`DIRECTORY_PAGE_RATE_LIMIT`, 51/min — Zoho publishes no per-minute limit for
+`getRecords`). Ceilings can be lowered through `createPeopleClient({ directoryLimits })`, never raised.
+Logs carry page/record counts and `PAGINATION_*` codes only.
+
+**Established only by synthetic tests** (15 paging checks, `tests/zoho.check.mjs` *employee pagination*):
+200 / 400 / 450 / 650-employee directories, duplicates across pages, repeated pages, timeouts, failed
+middle pages, ceilings, 18-digit precision across pages, and a failed refresh after a good one.
+
+**Consumers** (4 checks): `headcount` counts every page and a failed middle page is a 503, never a
+partial total; `employeeLookup` finds a page-3 employee, fails with a 503 on an incomplete walk even
+when the match was on page 1, and refuses a manager in live mode **before** any page is fetched; the
+`employees` source never caches a failed walk but does cache a complete one, and refuses a non-admin
+before fetching; all walks share one page limiter, so excess walks fail closed (local 429).
+
+**Not verified:** paging against more than 200 live employees (`limit=200`, `sIndex=201` onward) —
+do it once on a larger organisation before production.
+
+**Not a guaranteed snapshot.** Zoho returns no record count, snapshot or cursor, so a complete read
+cannot be proven — only every *detectable* inconsistency rejected. Unprovable, and therefore known
+limits: (1) Zoho's 7024 is its generic "No records found"; one sent for another reason directly after
+a full page would end the walk early and look complete — pinned by a test so it cannot change
+silently. (2) Employees added or removed while the walk runs can shift between pages: duplicates are
+caught, a skipped record is not. (3) A missing page could hide a duplicated ZUID. (4) Each walk of a
+large directory costs up to 51 calls against Zoho's plan-wide daily API limit, and `headcount` and
+`employeeLookup` walk on **every** call (uncached), the `employees` source once per admin per 5 min,
+and the E2 directory once per 5 min — redundant at scale; the shared limiter bounds it by failing
+excess walks, not by sharing one load (E2.2 candidate).
 
 **Employee output is exactly four fields:** `recordId`, `email`, `department`, `employmentTypeId`.
 `Date_of_birth`, `Gender` and `Photo` are read and deliberately discarded; everything unlisted is
@@ -734,12 +785,12 @@ be skipped for want of a bundler. **Do not add imports to `spec.js`.**
 npm run check                 # from root: all three suites
 cd backend  && npm run check  # runs BOTH backend suites, in order:
                               #   tests/check.mjs       ->  "all 113 backend checks pass"
-                              #   tests/zoho.check.mjs  ->  "all 284 zoho integration checks pass"
+                              #   tests/zoho.check.mjs  ->  "all 303 zoho integration checks pass"
 cd frontend && npm run check  #   test/dashboards.check.mjs -> "all 27 contract checks pass"
                               #   test/ui.check.mjs         -> "all 61 UI checks pass"
 ```
 
-**485 assertions total** (113 + 284 + 27 + 61, as of Phase 5.3 employee directory, 2026-10-13). All three were run and pass at these counts. No framework —
+**504 assertions total** (113 + 303 + 27 + 61, as of E2.1 employee pagination, 2026-10-14). All three were run and pass at these counts. No framework —
 plain `assert/strict` against the real modules, exit 1 on any failure. The only stand-in is in
 `test/ui.check.mjs`, which stubs `fetch` (unreachable / 403 / 500 / OK) to run the real API client
 and dashboard layer offline.
