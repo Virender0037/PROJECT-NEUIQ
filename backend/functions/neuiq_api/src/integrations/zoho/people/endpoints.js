@@ -12,12 +12,23 @@
 
 /** Endpoints confirmed against the live tenant. */
 export const CONFIRMED_ENDPOINTS = {
+  /**
+   * Paging confirmed 2026-10-14 against the .com test organisation (2 employees, 3 requests):
+   * `sIndex` is 1-based and honoured, `limit` is honoured (limit=1 returned one record), and
+   * sIndex=2 returned a different record. Reading past the last record returned HTTP 200,
+   * `status: 1`, `errors: { code: 7024, message: "No records found" }` and no `result` — see
+   * `classifyFormsPage` in envelope.js. `limit` max 200 is documented, not observed. Paging at
+   * more than 200 live employees has NOT been observed. (Zoho's parameter table spells it
+   * `slIndex`; the request URL, and the live organisation, use `sIndex`.)
+   */
   'people.employee.records': {
     method: 'GET',
     path: '/people/api/forms/employee/getRecords',
     envelope: 'forms',
     scopeKey: 'people.forms.read',
     confirmedOn: '2026-09-07',
+    confirmedParams: ['sIndex', 'limit'],
+    paramsConfirmedOn: '2026-10-14',
   },
   'people.leave.list': {
     method: 'GET',

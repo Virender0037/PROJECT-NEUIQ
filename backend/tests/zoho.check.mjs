@@ -30,6 +30,7 @@ import {
 } from '../functions/neuiq_api/src/integrations/zoho/people/transformers/dates.js';
 import {
   unwrapV3, flattenKeyedRecords, unwrapForms, EnvelopeError, FORMS_RESULT_PATH,
+  classifyFormsPage, FORMS_NO_RECORDS_CODE,
 } from '../functions/neuiq_api/src/integrations/zoho/people/transformers/envelope.js';
 import {
   mapHttpError, mapNetworkError, redact, isRetryable, isRefreshable,
@@ -67,7 +68,10 @@ import {
 } from '../functions/neuiq_api/src/integrations/zoho/people/transformers/balance.js';
 import { leaveBalancePeriod, parseLeaveYearStart } from '../functions/neuiq_api/src/integrations/zoho/people/leaveYear.js';
 import { createRateLimiter } from '../functions/neuiq_api/src/integrations/zoho/_shared/rateLimiter.js';
-import { createPeopleClient, BALANCE_RATE_LIMIT } from '../functions/neuiq_api/src/integrations/zoho/people/client.js';
+import {
+  createPeopleClient, BALANCE_RATE_LIMIT, EMPLOYEE_PAGE_SIZE, DIRECTORY_MAX_PAGES, DIRECTORY_MAX_RECORDS,
+  DIRECTORY_PAGE_RATE_LIMIT, PAGINATION,
+} from '../functions/neuiq_api/src/integrations/zoho/people/client.js';
 import { assertResultAllowed } from '../functions/neuiq_api/src/core/tools/registry.js';
 import {
   transformEmployeeIdentity, exactId, IDENTITY_FIELDS,
@@ -2224,5 +2228,369 @@ ok(() => {
   assert.equal(seed.employeeDirectory, undefined, 'and has no live employee directory');
   assert.equal(seed.directory.resolve({ employeeId: 'E1004' }).username, 'meera');
 }, 'seed mode: employee identity behaviour is unchanged');
+
+// ---------------------------------------------------------------- employee pagination (E2.1)
+// getRecords paging: sIndex 1-based, limit 200. The end-of-list body is the one recorded live on
+// 2026-10-14 (.com test organisation): HTTP 200, status 1, errors.code 7024, no result. Everything
+// below is synthetic — no organisation larger than two employees has been observed.
+
+/** 18-digit record ids beyond 2^53 and 9-digit ZUIDs, all synthetic. */
+const PG_ID = (i) => `5550000002${String(i).padStart(8, '0')}`;
+const PG_ZUID = (i) => `7${String(i).padStart(8, '0')}`;
+/** One page body as RAW TEXT: ids unquoted where Zoho sends numbers, so precision is really tested. */
+const pgPageText = (ids) => `{"response":{"result":[${ids.map((id, i) => `{"${id}":[{"Zoho_ID":${id},"ZUID":"${PG_ZUID(Number(id.slice(-8)))}","Employeestatus":"Active","Reporting_To.ID":"","FirstName":"Test","LastName":"Person${i}","EmailID":"e${id.slice(-8)}@example.test","Department":"Engineering"}]}`).join(',')}],"message":"Data fetched successfully","uri":"/api/forms/employee/getRecords","status":0}}`;
+const PG_NO_RECORDS_TEXT = '{"response":{"message":"Error occurred","uri":"/api/forms/employee/getRecords","errors":{"code":7024,"message":"No records found"},"status":1}}';
+
+/**
+ * A people client over a synthetic organisation of `total` employees.
+ * `override(sIndex, call)` may return [status, text], a Response, or 'hang' to take over a request.
+ */
+function pagingRig({ total = 0, ids = null, override = null, limits = {}, now, limiter } = {}) {
+  const org = ids ?? Array.from({ length: total }, (_, i) => PG_ID(i + 1));
+  const calls = [];
+  const lines = [];
+  const client = createPeopleClient({
+    dc: 'com', tokenProvider: stubProvider(),
+    logger: { log: (l) => lines.push(String(l)), warn: (l) => lines.push(String(l)) },
+    directoryLimiter: limiter ?? createRateLimiter({ name: 'test pages', ...DIRECTORY_PAGE_RATE_LIMIT }),
+    directoryLimits: limits,
+    ...(now ? { now } : {}),
+    fetchImpl: async (url, init) => {
+      const u = new URL(url);
+      const sIndex = Number(u.searchParams.get('sIndex'));
+      const limit = Number(u.searchParams.get('limit'));
+      calls.push({ sIndex, limit, keys: [...u.searchParams.keys()].sort() });
+      const o = override?.(sIndex, calls.length);
+      if (o === 'hang') {
+        return new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))));
+      }
+      if (o instanceof Response) return o;
+      const [status, text] = o ?? (() => {
+        const slice = org.slice(sIndex - 1, sIndex - 1 + limit);
+        return [200, slice.length ? pgPageText(slice) : PG_NO_RECORDS_TEXT];
+      })();
+      return new Response(text, { status, headers: { 'content-type': 'application/json' } });
+    },
+  });
+  return { client, calls, lines, org };
+}
+const pgStarts = (rig) => rig.calls.map((c) => c.sIndex);
+
+// -- the recorded contract --
+ok(() => {
+  assert.deepEqual(classifyFormsPage(parseZohoJson(PG_NO_RECORDS_TEXT)), { kind: 'noRecords' });
+  assert.equal(FORMS_NO_RECORDS_CODE, 7024);
+  const page = classifyFormsPage(parseZohoJson(pgPageText([PG_ID(1), PG_ID(2)])));
+  assert.equal(page.kind, 'rows');
+  assert.deepEqual(page.rows.map((r) => r.__recordId), [PG_ID(1), PG_ID(2)]);
+  assert.deepEqual(CONFIRMED_ENDPOINTS['people.employee.records'].confirmedParams, ['sIndex', 'limit']);
+}, 'pagination contract: the recorded end-of-list body is "noRecords"; a status-0 page is rows; sIndex/limit recorded as confirmed');
+
+ok(() => {
+  // Anything that is not EXACTLY the recorded shape is refused, never read as "no more records".
+  const variants = {
+    resultAlsoPresent: '{"response":{"result":[],"errors":{"code":7024,"message":"No records found"},"status":1}}',
+    statusZero: '{"response":{"errors":{"code":7024,"message":"No records found"},"status":0}}',
+    errorsArray: '{"response":{"errors":[{"code":7024,"message":"No records found"}],"status":1}}',
+    codeAsString: '{"response":{"errors":{"code":"7024","message":"No records found"},"status":1}}',
+    otherCode: '{"response":{"errors":{"code":7040,"message":"Permission denied to view records"},"status":1}}',
+    noErrors: '{"response":{"message":"Error occurred","status":1}}',
+    unknownStatus: '{"response":{"result":[],"status":2}}',
+    statusMissing: '{"response":{"result":[]}}',
+    statusZeroNoResult: '{"response":{"message":"Data fetched successfully","status":0}}',
+    statusZeroWithErrors: '{"response":{"result":[],"errors":{"code":7024},"status":0}}',
+    noResponse: '{"result":[]}',
+    notAnObject: '[]',
+  };
+  for (const [name, text] of Object.entries(variants)) {
+    assert.throws(() => classifyFormsPage(parseZohoJson(text)), EnvelopeError, name);
+  }
+  assert.throws(() => classifyFormsPage(null), EnvelopeError);
+}, 'pagination contract: every 7024 look-alike and every other error shape is refused, not treated as the end');
+
+// -- 1. empty directory --
+// CHANGED (E2.1 corrections): a 7024 on the FIRST page used to load as an empty directory. No empty
+// organisation has been observed, and "No records found" before any page could equally be a scope
+// or form problem — so it is now refused, and the directory is UNAVAILABLE rather than empty.
+await (async () => {
+  const rig = pagingRig({ total: 0 });
+  const err = await rig.client.employees().then(() => null, (e) => e);
+  assert.equal(err?.code, PAGINATION.NO_RECORDS_ON_FIRST_PAGE);
+  assert.equal(err?.status, 502);
+  assert.deepEqual(pgStarts(rig), [1], 'refused without retrying or reading further');
+  const dir = createEmployeeDirectory({ loadRecords: () => rig.client.employees() });
+  assert.deepEqual(await dir.resolveZuid(PG_ZUID(1)), { ok: false, reason: LOOKUP.UNAVAILABLE });
+  n++; console.log('ok   pagination: 7024 on the FIRST page is refused (unverified as empty) — the directory is UNAVAILABLE, not empty');
+})();
+
+// -- 2. one page --
+await (async () => {
+  const rig = pagingRig({ total: 37 });
+  const rows = await rig.client.employees();
+  assert.equal(rows.length, 37);
+  assert.deepEqual(pgStarts(rig), [1], 'a short first page ends the walk: no further request');
+  assert.deepEqual(rig.calls[0], { sIndex: 1, limit: EMPLOYEE_PAGE_SIZE, keys: ['limit', 'sIndex'] });
+  n++; console.log('ok   pagination: one short page — one request, sIndex=1&limit=200 and nothing else sent');
+})();
+
+// -- 3–6. multiple pages, exact multiples, and larger --
+await (async () => {
+  for (const [total, starts] of [
+    [200, [1, 201]],                   // exactly 200: the second request reads the end
+    [400, [1, 201, 401]],              // exactly 400
+    [450, [1, 201, 401]],              // multiple pages, short last page
+    [650, [1, 201, 401, 601]],         // larger than 400
+  ]) {
+    const rig = pagingRig({ total });
+    const rows = await rig.client.employees();
+    assert.equal(rows.length, total, `${total}: every employee`);
+    assert.deepEqual(rows.map((r) => r.__recordId), rig.org, `${total}: in order, none missing, none repeated`);
+    assert.deepEqual(pgStarts(rig), starts, `${total}: requests`);
+    assert.ok(rig.calls.every((c) => c.limit === EMPLOYEE_PAGE_SIZE));
+  }
+  n++; console.log('ok   pagination: 200, 400, 450 and 650 employees load completely, in order, with the minimum requests');
+})();
+
+// -- 7. duplicates --
+await (async () => {
+  const across = pagingRig({ total: 300, override: (s) => (s === 201 ? [200, pgPageText([PG_ID(201), PG_ID(5), PG_ID(202)])] : null) });
+  assert.equal(await reason(across.client.employees()), PAGINATION.DUPLICATE_RECORD);
+  const within = pagingRig({ ids: [PG_ID(1), PG_ID(2), PG_ID(1)] });
+  assert.equal(await reason(within.client.employees()), PAGINATION.DUPLICATE_RECORD);
+  n++; console.log('ok   pagination: a __recordId seen twice — across pages or within one — rejects the whole directory');
+})();
+
+// -- 8. malformed and unexpected responses --
+await (async () => {
+  const bad = {
+    'non-JSON body': [200, '<html>maintenance</html>'],
+    'status 0 without a result': [200, '{"response":{"message":"Data fetched successfully","status":0}}'],
+    'another Zoho error': [200, '{"response":{"errors":{"code":7040,"message":"Permission denied to view records"},"status":1}}'],
+    'unknown status': [200, '{"response":{"result":[],"status":2}}'],
+  };
+  for (const [name, reply] of Object.entries(bad)) {
+    const rig = pagingRig({ total: 450, override: (s) => (s === 201 ? reply : null) });
+    assert.equal(await reason(rig.client.employees()), PAGINATION.UNEXPECTED_RESPONSE, name);
+  }
+  const empty = pagingRig({ total: 450, override: (s) => (s === 201 ? [200, '{"response":{"result":[],"message":"Data fetched successfully","status":0}}'] : null) });
+  assert.equal(await reason(empty.client.employees()), PAGINATION.EMPTY_PAGE);
+  const oversized = Array.from({ length: EMPLOYEE_PAGE_SIZE + 1 }, (_, i) => PG_ID(i + 1));
+  const big = pagingRig({ total: 0, override: () => [200, pgPageText(oversized)] });
+  assert.equal(await reason(big.client.employees()), PAGINATION.OVERSIZED_PAGE);
+  n++; console.log('ok   pagination: malformed bodies, other errors, empty status-0 pages and oversized pages all reject the directory');
+})();
+
+// -- 9. a failed intermediate page --
+await (async () => {
+  const server = pagingRig({ total: 650, override: (s) => (s === 401 ? [500, '{"message":"internal"}'] : null) });
+  const err = await server.client.employees().then(() => null, (e) => e);
+  assert.equal(err?.name, 'ZohoUpstreamError', 'the failure surfaces, not a shorter list');
+  assert.equal(err?.status, 503, 'a Zoho 5xx is a 503 to our callers, as everywhere else');
+  assert.deepEqual(pgStarts(server), [1, 201, 401], 'not retried, and nothing after the failed page');
+
+  let lockedFor = null;
+  const limiter = { acquire() {}, lockout: (s) => { lockedFor = s; } };
+  const limited = pagingRig({ total: 450, limiter, override: (s) => (s === 201 ? new Response('{}', { status: 429, headers: { 'retry-after': '90' } }) : null) });
+  const limitedErr = await limited.client.employees().then(() => null, (e) => e);
+  assert.equal(limitedErr?.name, 'ZohoRateLimitError');
+  assert.equal(limitedErr?.status, 429);
+  assert.equal(lockedFor, 90, 'a Zoho 429 locks the local limiter for its Retry-After');
+  assert.deepEqual(pgStarts(limited), [1, 201], 'and is not retried');
+  n++; console.log('ok   pagination: a failed middle page (5xx, 429) rejects the whole walk — no retry, no partial result, 429 locks out');
+})();
+
+// -- 10. timeout --
+await (async () => {
+  const hung = pagingRig({ total: 450, limits: { deadlineMs: 40 }, override: (s) => (s === 201 ? 'hang' : null) });
+  assert.equal(await reason(hung.client.employees()), PAGINATION.TIMEOUT);
+  let t = 0;
+  const slow = pagingRig({ total: 450, limits: { deadlineMs: 1000 }, now: () => t, override: () => { t += 600; return null; } });
+  assert.equal(await reason(slow.client.employees()), PAGINATION.TIMEOUT);
+  assert.deepEqual(pgStarts(slow), [1, 201], 'the deadline stops the walk before the next request');
+  n++; console.log('ok   pagination: a hung page and a walk past its overall deadline both reject the directory');
+})();
+
+// -- 11. repeated pages --
+await (async () => {
+  const first = Array.from({ length: EMPLOYEE_PAGE_SIZE }, (_, i) => PG_ID(i + 1));
+  const stuck = pagingRig({ total: 0, override: () => [200, pgPageText(first)] });
+  assert.equal(await reason(stuck.client.employees()), PAGINATION.REPEATED_PAGE);
+  assert.deepEqual(pgStarts(stuck), [1, 201], 'caught on the second request, not after looping');
+  n++; console.log('ok   pagination: a server that ignores sIndex (the same page again) is caught as a loop');
+})();
+
+// -- 12. safety limits --
+await (async () => {
+  assert.equal(DIRECTORY_MAX_RECORDS, MAX_DIRECTORY_RECORDS, 'client and directory agree on the record ceiling');
+  assert.equal(DIRECTORY_MAX_PAGES * EMPLOYEE_PAGE_SIZE, DIRECTORY_MAX_RECORDS);
+  assert.ok(DIRECTORY_PAGE_RATE_LIMIT.limit >= DIRECTORY_MAX_PAGES + 1, 'the limiter admits one full walk');
+
+  const exact = pagingRig({ total: 400, limits: { maxPages: 2 } });
+  assert.equal((await exact.client.employees()).length, 400, 'exactly maxPages full pages: the end read is still allowed');
+  const over = pagingRig({ total: 401, limits: { maxPages: 2 } });
+  assert.equal(await reason(over.client.employees()), PAGINATION.PAGE_LIMIT);
+  assert.deepEqual(pgStarts(over), [1, 201, 401]);
+  const records = pagingRig({ total: 450, limits: { maxRecords: 300 } });
+  assert.equal(await reason(records.client.employees()), PAGINATION.RECORD_LIMIT);
+
+  // Limits can be lowered, never raised: 1e9 pages is clamped to the 50-page ceiling.
+  const clamped = pagingRig({ total: DIRECTORY_MAX_RECORDS + 1, limits: { maxPages: 1e9, maxRecords: 1e9 } });
+  assert.equal(await reason(clamped.client.employees()), PAGINATION.PAGE_LIMIT);
+  assert.equal(clamped.calls.length, DIRECTORY_MAX_PAGES + 1);
+  n++; console.log('ok   pagination: page and record ceilings reject an oversized organisation; limits can be lowered, never raised');
+})();
+
+// -- 13. precision --
+await (async () => {
+  const rig = pagingRig({ total: 250 });
+  const rows = await rig.client.employees();
+  for (const [i, r] of rows.entries()) {
+    assert.equal(typeof r.__recordId, 'string');
+    assert.equal(r.__recordId, rig.org[i]);
+    assert.equal(r.Zoho_ID, rig.org[i], 'the unquoted 18-digit Zoho_ID arrives as the exact string');
+  }
+  assert.ok(Number(PG_ID(1)) > Number.MAX_SAFE_INTEGER, 'the fixture ids really are past 2^53');
+  const index = buildEmployeeIndex(rows);
+  assert.equal(index.counts.indexed, 250);
+  assert.equal(index.issues.record_id_mismatch, 0);
+  n++; console.log('ok   pagination: 18-digit ids survive every page exactly, and the identity index accepts them all');
+})();
+
+// -- 14. a failed refresh after a successful one --
+await (async () => {
+  let t = 0;
+  let failNext = false;
+  const rig = pagingRig({ total: 450, override: (s) => (failNext && s === 201 ? [503, '{}'] : null) });
+  const lines = [];
+  const dir = createEmployeeDirectory({
+    loadRecords: () => rig.client.employees(), now: () => t,
+    logger: { info: (o) => lines.push(JSON.stringify(o)), warn: (o) => lines.push(JSON.stringify(o)) },
+  });
+  assert.equal((await dir.resolveZuid(PG_ZUID(300))).ok, true, 'an employee from page 2 resolves');
+  failNext = true;
+  t += DIRECTORY_MAX_TTL_MS;
+  assert.deepEqual(await dir.resolveZuid(PG_ZUID(1)), { ok: false, reason: LOOKUP.UNAVAILABLE }, 'page 1 loaded again, page 2 failed: no partial, no stale');
+  assert.deepEqual(await dir.resolveZuid(PG_ZUID(300)), { ok: false, reason: LOOKUP.UNAVAILABLE });
+  assert.equal(dir.status().loaded, false);
+  assert.ok(lines.some((l) => l.includes('directory.refresh_failed')));
+  n++; console.log('ok   pagination: a failed refresh after a good one is UNAVAILABLE — neither the old snapshot nor the pages that did load');
+})();
+
+// -- 15. a 7024 only ends the walk where the recorded one did --
+await (async () => {
+  // Directly after a SHORT page the walk never asks again, so no 7024 can be read there.
+  const short = pagingRig({ total: 150, override: (s) => (s > 1 ? [200, PG_NO_RECORDS_TEXT] : null) });
+  assert.equal((await short.client.employees()).length, 150);
+  assert.deepEqual(pgStarts(short), [1]);
+  // A 7024 carried by an HTTP error is an error.
+  for (const status of [400, 404, 500]) {
+    const rig = pagingRig({ total: 450, override: (s) => (s === 201 ? [status, PG_NO_RECORDS_TEXT] : null) });
+    assert.notEqual(await reason(rig.client.employees()), 'resolved', `HTTP ${status}`);
+  }
+  // A 7024 look-alike mid-walk is UNEXPECTED, not the end.
+  const lookAlike = pagingRig({ total: 450, override: (s) => (s === 201 ? [200, '{"response":{"result":[],"errors":{"code":7024,"message":"No records found"},"status":1}}'] : null) });
+  assert.equal(await reason(lookAlike.client.employees()), PAGINATION.UNEXPECTED_RESPONSE);
+  // The documented residual risk, pinned so it cannot change silently: the EXACT 7024 directly
+  // after a full page is read as the end, even if more employees exist. Zoho gives nothing to
+  // tell the two apart.
+  const truncated = pagingRig({ total: 450, override: (s) => (s === 201 ? [200, PG_NO_RECORDS_TEXT] : null) });
+  assert.equal((await truncated.client.employees()).length, 200);
+  n++; console.log('ok   pagination: 7024 is accepted only in the recorded position and shape; HTTP-error and look-alike 7024s reject the directory');
+})();
+
+// -- logs --
+await (async () => {
+  const rig = pagingRig({ total: 450 });
+  await rig.client.employees();
+  const failed = pagingRig({ total: 450, override: (s) => (s === 201 ? [200, pgPageText([PG_ID(1)])] : null) });
+  await failed.client.employees().catch(() => {});
+  const all = [...rig.lines, ...failed.lines].join('\n');
+  for (const id of rig.org.slice(0, 450)) assert.equal(all.includes(id), false);
+  assert.equal(/example\.test|Person\d|7\d{8}/.test(all), false, 'no email, name or ZUID');
+  assert.ok(all.includes('"zoho.people.employees.loaded"') && all.includes('"records":450'));
+  assert.ok(all.includes(PAGINATION.DUPLICATE_RECORD));
+  n++; console.log('ok   pagination: logs carry page and record counts and failure codes only — no id, ZUID, name or email');
+})();
+
+// ---------------------------------------------------------------- employees() consumers (E2.1)
+// Every caller of the paged employees(): the live `employees` query source, live headcount, live
+// employeeLookup, and the E2 directory (tests 1 and 14 above). Each must see the WHOLE directory
+// or an error — never a partial list, never a substitute, never wider reach.
+const failPage2 = (rigOpts = {}) => {
+  let failing = true;
+  const rig = pagingRig({ total: 450, ...rigOpts, override: (s) => (failing && s === 201 ? [503, '{"message":"unavailable"}'] : null) });
+  return { ...rig, heal: () => { failing = false; } };
+};
+const pgNoIdsIn = (text) => !/\d{18}|7\d{8}|example\.test/.test(String(text));
+
+// -- headcount --
+await (async () => {
+  const good = pagingRig({ total: 450 });
+  const d = await buildLiveTools({ client: good.client })['zohoPeople.headcount'].run({ groupBy: 'department' }, ADMIN);
+  assert.equal(d.total, 450, 'counts every page');
+  assert.deepEqual(d.groups, [{ name: 'Engineering', value: 450 }]);
+  assert.deepEqual(pgStarts(good), [1, 201, 401]);
+
+  const bad = failPage2();
+  const err = await buildLiveTools({ client: bad.client })['zohoPeople.headcount'].run({ groupBy: 'department' }, ADMIN).then(() => null, (e) => e);
+  assert.equal(err?.status, 503, 'the failure propagates — no total of 200 from the page that did load');
+  assert.ok(pgNoIdsIn(err.message));
+  n++; console.log('ok   consumer headcount: counts all 450 across pages; a failed middle page is a 503, never a partial total');
+})();
+
+// -- employeeLookup --
+await (async () => {
+  const good = pagingRig({ total: 450 });
+  const d = await buildLiveTools({ client: good.client })['zohoPeople.employeeLookup'].run({ name: 'e00000430' }, ADMIN);
+  assert.equal(d.count, 1, 'an employee on page 3 is found');
+  assert.equal(d.employees[0].employeeId, PG_ID(430));
+  assert.deepEqual(Object.keys(d.employees[0]), PERSON_FIELDS, 'allow-listed fields only');
+
+  const bad = failPage2();
+  const err = await buildLiveTools({ client: bad.client })['zohoPeople.employeeLookup'].run({ name: 'e00000001' }, ADMIN).then(() => null, (e) => e);
+  assert.equal(err?.status, 503, 'even a match on page 1 is not returned from an incomplete walk');
+  assert.ok(pgNoIdsIn(err.message));
+
+  // Reach is decided before any request: in live mode a manager's team is unknown -> 403, zero calls.
+  const mgr = pagingRig({ total: 450 });
+  await withLiveDirectory(async () => {
+    await assert.rejects(() => buildLiveTools({ client: mgr.client })['zohoPeople.employeeLookup'].run({ name: 'e' }, MANAGER_LIVE), (e) => e.status === 403);
+  });
+  assert.equal(mgr.calls.length, 0, 'no page is fetched for a caller who may not search');
+  n++; console.log('ok   consumer employeeLookup: finds a page-3 employee; a failed walk is a 503; a manager is refused before any page');
+})();
+
+// -- the live `employees` query source --
+await (async () => {
+  const rig = failPage2();
+  registerSources({ __pgEmployees: buildLiveSources({ client: rig.client }).employees });
+  const admin = { employeeId: 'E9101', role: 'hr_admin' };   // its own cache key
+  const spec = { source: '__pgEmployees', metric: 'count' };
+
+  await assert.rejects(() => runQueryAsync(spec, admin), (e) => e.status === 503);
+  rig.heal();
+  const after = rig.calls.length;
+  assert.equal((await runQueryAsync(spec, admin)).data[0].value, 450, 'the failure was not cached: the next query walks again');
+  assert.equal(rig.calls.length, after + 3);
+  await runQueryAsync(spec, admin);
+  assert.equal(rig.calls.length, after + 3, 'a complete directory IS cached for its TTL: no second walk');
+
+  const before = rig.calls.length;
+  await assert.rejects(() => runQueryAsync(spec, { employeeId: 'E1002', role: 'employee' }), (e) => e.status === 403);
+  assert.equal(rig.calls.length, before, 'a non-admin is refused before any page is fetched');
+  n++; console.log('ok   consumer employees source: failures are not cached, complete loads are, and non-admins are refused before fetching');
+})();
+
+// -- all consumers share one page budget --
+await (async () => {
+  const limiter = createRateLimiter({ name: 'test shared pages', limit: 5, windowMs: 60_000, lockoutMs: 120_000 });
+  const rig = pagingRig({ total: 450, limiter });
+  const tools = buildLiveTools({ client: rig.client });
+  assert.equal((await tools['zohoPeople.headcount'].run({ groupBy: 'department' }, ADMIN)).total, 450);   // 3 pages
+  const err = await tools['zohoPeople.employeeLookup'].run({ name: 'e00000001' }, ADMIN).then(() => null, (e) => e);
+  assert.equal(err?.code, 'LOCAL_RATE_LIMIT', 'the second walk runs out of budget and fails closed');
+  assert.equal(rig.calls.length, 5, 'and the refused page never reached the network');
+  n++; console.log('ok   consumers: every walk draws on one shared page limiter — excess walks fail closed instead of flooding Zoho');
+})();
 
 console.log(`\nall ${n} zoho integration checks pass`);
