@@ -4,6 +4,7 @@ import Icon from '@shared/icons/Icon.jsx';
 import { THEMES, ACCENTS, themeIcon } from '@shared/lib/theme.js';
 import { UI_STYLES } from '@shared/data/appearance.js';
 import { VIEW_TITLE } from '../lib/nav.js';
+import { profileFor } from '@shared/lib/profile.js';
 
 /**
  * TopBar — page title on the left, tool capsule on the right.
@@ -13,6 +14,7 @@ import { VIEW_TITLE } from '../lib/nav.js';
  */
 export default function TopBar({ view }) {
   const app = useApp();
+  const me = profileFor(app.user);
   const { theme, accent } = app;
   const [menu, setMenu] = useState(null);   // 'theme' | 'user' | null
   const wrapRef = useRef(null);
@@ -96,12 +98,18 @@ export default function TopBar({ view }) {
 
         <div style={{ position: 'relative' }}>
           <button className="icon-sq" onClick={() => setMenu(m => (m === 'user' ? null : 'user'))}
-            title="Account" aria-haspopup="menu" aria-expanded={menu === 'user'} aria-label="Account">
-            <Icon name="user" size={17} />
+            title={`Account: ${me.name}`} aria-haspopup="menu" aria-expanded={menu === 'user'} aria-label={`Account: ${me.name}, ${me.role}`}>
+            {me.initials ? <span style={{ fontSize: 12.5, fontWeight: 700 }}>{me.initials}</span> : <Icon name="user" size={17} />}
           </button>
           {menu === 'user' && (
             <div className="nav-menu right open" role="menu"
               style={{ position: 'absolute', top: 'calc(100% + 8px)', right: 0, left: 'auto', minWidth: 190, zIndex: 200 }}>
+              {/* The same identity Classic's sidebar shows — the authenticated user, from
+                  shared/lib/profile.js, with "User" rather than an invented name if one is missing. */}
+              <div role="presentation" style={{ padding: '10px 12px 8px', borderBottom: '1px solid var(--line, rgba(0,0,0,.08))', marginBottom: 4 }}>
+                <div style={{ fontSize: 13.5, fontWeight: 650, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{me.name}</div>
+                <div style={{ fontSize: 12, color: 'var(--ink-dim)' }}>{me.role}</div>
+              </div>
               <button className="mn-link" style={{ padding: '10px 12px', fontSize: 13.5 }}
                 onClick={() => { setMenu(null); app.go('settings'); }}>
                 <Icon name="settings" size={15} />Settings

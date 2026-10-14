@@ -1,16 +1,21 @@
 import { createContext, useContext, useState, useRef, useCallback, useEffect } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { seedConversation, answerFor } from '../data/mockData.js';
+import { CONNECTION } from '../data/emptyStates.js';
 import { pathToView, pathFor } from '../lib/routes.js';
 import { THEMES, THEME_IDS, ACCENT_IDS, isDarkTheme } from '../lib/theme.js';
 import { api, setToken, getToken, ApiError, useOffline } from '../api/index.js';
+import { normaliseDataSource, dataSourceInfo } from '../lib/dataSource.js';
+import { normaliseAuthMode, loginOptions, SIGN_IN_COPY } from '../lib/authMode.js';
+import { profileFor } from '../lib/profile.js';
 
 /** App-wide defaults (were DC props). Change these to reconfigure the demo. */
 export const CONFIG = {
   uiStyle: 'classic',      // 'classic' | 'hybrid' | 'modern' — which layout renders
   defaultTheme: 'light',   // any id from THEMES in ../lib/theme.js
   accent: '',              // any id from ACCENTS; '' keeps the style's own base accent
-  greetingName: 'Alex',
+  // No default person. A `greetingName: 'Alex'` used to stand in whenever the user's name was
+  // unknown — including for the offline local session — so the app greeted someone who was not
+  // there. Identity comes only from the authenticated user (shared/lib/profile.js).
   density: 'comfortable',  // 'comfortable' | 'compact'
 };
 
@@ -149,12 +154,9 @@ export function AppProvider({ children }) {
     setMessages([]); setStreamText(''); setStreaming(false); setThinking(false);
   }, [navigate, theme, setTheme]);
 
-  const loadConvo = useCallback(() => {
-    clearTimers();
-    navigate(pathFor('chat')); setIncognito(false); setMessages(seedConversation());
-    setThinking(false); setStreaming(false); setStreamText(''); setComposer('');
-    scrollBottom();
-  }, [scrollBottom, navigate]);
+  // There is deliberately no `loadConvo`. It used to open every "saved" chat as the same canned
+  // transcript (a 90-day product roadmap with invented metrics), rendered as a real assistant
+  // reply. Conversations are not stored yet, so there is nothing to open; History says so.
 
   // ---- theme ----
   const themeLabel = (id) => THEMES.find((t) => t.id === id)?.label || id;
@@ -229,10 +231,13 @@ export function AppProvider({ children }) {
      * "and last month?", but sending the whole transcript grows every request without
      * improving the answer — and in a private chat there is nothing to carry forward at all.
      */
-    const history = incognitoRef.current ? [] : messagesRef.current.slice(-6).map((m) => ({
-      role: m.role === 'user' ? 'user' : 'assistant',
-      text: m.role === 'user' ? m.text : (m.blocks || []).map((b) => b.text).join(' '),
-    }));
+    // Connection notices are not part of the conversation: they were never said by the
+    // assistant, and sending one as an "assistant" turn would hand the model a fabricated reply.
+    const history = incognitoRef.current ? [] : messagesRef.current
+      .filter((m) => m.role !== 'notice').slice(-6).map((m) => ({
+        role: m.role === 'user' ? 'user' : 'assistant',
+        text: m.role === 'user' ? m.text : (m.blocks || []).map((b) => b.text).join(' '),
+      }));
 
     const ctl = new AbortController();
     chatCtl.current = ctl;
@@ -245,9 +250,15 @@ export function AppProvider({ children }) {
     } catch (err) {
       if (ctl.signal.aborted) return;
       if (err instanceof ApiError && err.offline) {
-        // The API is down. Local sample answers keep the demo usable, but the bubble is
-        // labelled 'sample' so nobody reads a made-up figure as a Zoho one.
-        typeOut(answerFor(trimmed), { source: 'sample', outcome: 'ok' });
+        // The API is down, so there is no answer — and none is invented. This used to type out a
+        // canned assistant reply labelled 'sample'; now the question stays on screen with a
+        // notice that it was NOT sent, and a retry. Messages already shown are left untouched.
+        setThinking(false); setStreaming(false); setStreamText('');
+        setMessages((m) => [...m, {
+          id: 'n' + Date.now(), role: 'notice', kind: 'unavailable',
+          text: CONNECTION.chatNotSent, retryOf: um.id, retryText: trimmed,
+        }]);
+        scrollBottom();
       } else {
         // A 403 or a 400 is a real answer about what you may ask. Show it as itself rather
         // than substituting sample data, which would misrepresent your permissions.
@@ -257,6 +268,23 @@ export function AppProvider({ children }) {
       if (chatCtl.current === ctl) chatCtl.current = null;
     }
   }, [scrollBottom, typeOut, navigate]);
+
+  /**
+   * Retry a question that could not be sent. The failed attempt (the question and its notice) is
+   * taken back out first, so a retry that succeeds reads as one question and one answer rather
+   * than a duplicate — and a retry that fails again simply shows the notice again.
+   */
+  const retryMessage = useCallback((notice) => {
+    if (!notice?.retryText || streamingRef.current) return;
+    const keep = (x) => x.id !== notice.id && x.id !== notice.retryOf;
+    setMessages((m) => m.filter(keep));
+    // send() reads history from the ref, which would otherwise still hold the failed question
+    // until the next render and send it to the model as an earlier turn.
+    messagesRef.current = messagesRef.current.filter(keep);
+    composerRef.current = notice.retryText;
+    setComposer(notice.retryText);
+    send();
+  }, [send]);
 
   const stop = useCallback(() => {
     clearTimers();
@@ -314,6 +342,42 @@ export function AppProvider({ children }) {
   const offline = useOffline();
 
   /**
+   * Where the backend's data comes from, as it REPORTS it: 'seed' | 'zoho' | null, or undefined
+   * until it has answered. Reachability alone never decides this — a backend that answers may be
+   * serving generated demo records. See shared/lib/dataSource.js for what each value shows.
+   *
+   * Read from /health (unauthenticated, so the sign-in screen knows too) and refreshed by /me.
+   * A non-offline failure leaves it null — "unavailable" — rather than undefined, so a broken
+   * health check is never mistaken for one still in flight.
+   */
+  const [dataSource, setDataSource] = useState(undefined);
+  /**
+   * How this backend signs people in: 'demo' | 'zoho' | null (unrecognised), undefined until
+   * /health answers. Demo sign-in is offered ONLY on an explicit 'demo' — see shared/lib/authMode.js.
+   * The backend enforces the same rule on its own; this decides only what the screen offers.
+   */
+  const [authMode, setAuthMode] = useState(undefined);
+  const authModeRef = useRef(undefined);
+  authModeRef.current = authMode;
+  useEffect(() => {
+    let live = true;
+    api.health()
+      .then((r) => {
+        if (!live) return;
+        setDataSource(normaliseDataSource(r?.dataSource ?? null));
+        setAuthMode(normaliseAuthMode(r?.authMode ?? null));
+      })
+      .catch((err) => {
+        if (!live || (err instanceof ApiError && err.offline)) return;
+        setDataSource(null);
+        setAuthMode(null);
+      });
+    return () => { live = false; };
+  }, []);
+  const dataInfo = dataSourceInfo({ dataSource, offline });
+  const signInOptions = loginOptions({ authMode, offline });
+
+  /**
    * Restore a session from the remembered token.
    *
    * `/me` is called rather than decoding the token client-side, because the role must come from
@@ -324,27 +388,42 @@ export function AppProvider({ children }) {
     if (!getToken()) return;
     let live = true;
     api.me()
-      .then(({ user: u }) => { if (live) { setUser(u); setAuthed(true); setLanding(false); } })
+      .then(({ user: u, dataSource: ds }) => {
+        if (!live) return;
+        setUser(u); setAuthed(true); setLanding(false);
+        if (ds !== undefined) setDataSource(normaliseDataSource(ds));
+      })
       // An expired token is not an error worth showing: the client already cleared it on the
       // 401, so falling through to the sign-in screen is the correct outcome.
       .catch(() => {});
     return () => { live = false; };
   }, []);
 
-  /** The seeded demo accounts, offered on the sign-in screen. Empty when the API is down. */
+  /**
+   * The seeded demo accounts, offered on the sign-in screen — requested ONLY once the backend has
+   * said it is in demo mode. In zoho mode the route does not exist; asking anyway would be a
+   * request built on an assumption.
+   */
   const [demoUsers, setDemoUsers] = useState([]);
   useEffect(() => {
-    api.demoUsers().then(({ users }) => setDemoUsers(users)).catch(() => setDemoUsers([]));
-  }, []);
+    if (authMode !== 'demo') { setDemoUsers([]); return undefined; }
+    let live = true;
+    api.demoUsers()
+      .then(({ users }) => { if (live) setDemoUsers(users); })
+      .catch(() => { if (live) setDemoUsers([]); });
+    return () => { live = false; };
+  }, [authMode]);
 
   /**
-   * Sign in. There is no password check — see the note at the top of
+   * Demo sign-in. There is no password check — see the note at the top of
    * backend/functions/neuiq_api/src/middleware/index.js.
    *
-   * With the API down it still lets you in, as a clearly local session, because the alternative
-   * is a demo that cannot be opened at all when only the frontend is running.
+   * Refused here unless the backend reported demo mode (the backend refuses on its own as well:
+   * in zoho mode /auth/login does not exist). An unreachable server is a failed sign-in — no
+   * local session is ever created.
    */
   const doAuth = useCallback(async (username = 'alex') => {
+    if (authModeRef.current !== 'demo') { setAuthError(SIGN_IN_COPY.demoOnly); return; }
     setAuthBusy(true); setAuthError('');
     try {
       const { token, user: u } = await api.login(String(username).trim().toLowerCase() || 'alex');
@@ -352,17 +431,14 @@ export function AppProvider({ children }) {
       setUser(u);
       setAuthed(true);
     } catch (err) {
-      if (err instanceof ApiError && err.offline) {
-        setUser({ name: CONFIG.greetingName, username: 'demo', role: 'employee', isAdmin: false, offline: true });
-        setAuthed(true);
-        pushToast('Signed in locally — API offline');
-      } else {
-        setAuthError(err.message);
-      }
+      // Nobody is signed in unless the SERVER verified them. This used to create a local,
+      // "authenticated" user when the API was unreachable — a session no server had checked,
+      // holding a role no server had granted. Now an unreachable server is a failed sign-in.
+      setAuthError(err instanceof ApiError && err.offline ? CONNECTION.signIn : err.message);
     } finally {
       setAuthBusy(false);
     }
-  }, [pushToast]);
+  }, []);
 
   const enterAuth = useCallback((v) => { setLanding(false); setAuthView(v); }, []);
   const toggleAuthView = useCallback(() => setAuthView((a) => (a === 'signup' ? 'login' : 'signup')), []);
@@ -420,10 +496,9 @@ export function AppProvider({ children }) {
     if (incognito) return "You're in a private chat";
     const h = new Date().getHours();
     const part = h < 12 ? 'morning' : h < 18 ? 'afternoon' : 'evening';
-    // The signed-in employee's own first name once we have it, so the greeting matches whoever
-    // actually authenticated rather than the demo default.
-    const who = user?.name?.split(' ')[0] || CONFIG.greetingName;
-    return `Good ${part}, ${who}`;
+    // The signed-in employee's own first name, or no name at all — never a default person.
+    const who = profileFor(user).firstName;
+    return who ? `Good ${part}, ${who}` : `Good ${part}`;
   })();
 
   const value = {
@@ -432,12 +507,12 @@ export function AppProvider({ children }) {
     settingsTab, projTab, pgTab, histFilter, toasts, landing, authed, authView, density,
     rowMenu, sidebarWidth, resizing, prefs, greeting,
     // backend session
-    user, authBusy, authError, demoUsers, offline,
+    user, authBusy, authError, demoUsers, offline, dataSource, dataInfo, authMode, signInOptions,
     // setters used directly by screens
     setSettingsTab, setProjTab, setPgTab, setHistFilter, setTheme, setAccent, setComposer, setUiStyle,
     // actions
-    pushToast, toast, go, newChat, toggleSidebar, toggleIncognito, loadConvo, cycleTheme, themeLabel,
-    send, stop, sendOrStop, pinAnswer, pickSuggestion, doAuth, enterAuth, toggleAuthView, logout,
+    pushToast, toast, go, newChat, toggleSidebar, toggleIncognito, cycleTheme, themeLabel,
+    send, stop, sendOrStop, retryMessage, pinAnswer, pickSuggestion, doAuth, enterAuth, toggleAuthView, logout,
     openRowMenu, closeRowMenu, toggleDensity, togglePref, startResize, openSearch, scrollBottom,
   };
 

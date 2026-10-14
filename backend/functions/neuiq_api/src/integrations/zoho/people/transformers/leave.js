@@ -26,14 +26,16 @@
  * everything under "—" until the row is enriched from the employee record. That is a known gap,
  * not an oversight — see the note at the bottom of this file.
  *
- * ## Values are passed through, not translated
+ * ## Status is normalised; everything else is passed through
  *
- * `approval_status` and `unit` are carried verbatim. The field NAMES were confirmed; their VALUE
- * domains were not. The seed uses "Approved"; Zoho may use "APPROVED". Mapping one to the other
- * would be inventing a translation table, so the casing question is left open deliberately and is
- * called out in the gap note below.
+ * `approval_status` becomes `status` through people/leaveStatus.js: case-insensitive, mapped to
+ * the seed's labels, with only APPROVED counting as approved. The original value is kept as
+ * `statusRaw`. Zoho's own documentation disagrees on casing (upper-case filter values, title-case
+ * sample response) and live data returned an undocumented NO_STATUS, so matching on the raw
+ * string — what every consumer used to do — matched nothing. `unit` is still carried verbatim.
  */
 import { fromZohoDate, monthKey } from './dates.js';
+import { normaliseLeaveStatus } from '../leaveStatus.js';
 
 /** Round a day count without float noise. Half-days are real, thousandths are not. */
 const round2 = (n) => Math.round(n * 100) / 100;
@@ -116,7 +118,10 @@ export function transformLeaveRecord(raw, { includeAvatar = false } = {}) {
 
     // ---- what the query engine groups and aggregates on ----
     leaveType: str(leaveType.name),
-    status: str(raw.approval_status),
+    /** Normalised through leaveStatus.js — the seed's labels, matched case-insensitively. */
+    status: normaliseLeaveStatus(raw.approval_status),
+    /** Exactly what Zoho sent, so an unmapped value is never lost to the normalisation. */
+    statusRaw: str(raw.approval_status),
     days: round2(dayBreakdown.reduce((sum, d) => sum + d.leaveCount, 0)),
     from,
     month: monthKey(from),
@@ -165,8 +170,9 @@ export const LEAVE_GAPS = Object.freeze({
     + 'on leave and the seed supplies it, so on live data that grouping collapses to "—" until '
     + 'rows are enriched from the employee record.',
   statusValues:
-    'approval_status VALUES are unobserved. The seed uses "Approved"; Zoho may use "APPROVED". '
-    + 'Values are passed through untranslated rather than guessing a mapping.',
+    'approval_status is normalised case-insensitively by leaveStatus.js and kept raw as statusRaw. '
+    + 'Observed live: NO_STATUS only (undocumented; NOT treated as approved). Documented: APPROVED, '
+    + 'PENDING, REJECTED, CANCELLED, CANCEL_PENDING. Only APPROVED counts as approved leave.',
   dayKeyFormat:
     'The format of the keys inside `days` was not confirmed. Parsed leniently, with the raw key '
     + 'kept as sourceDate so nothing is lost if it is not dd-MMM-yyyy.',

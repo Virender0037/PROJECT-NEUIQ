@@ -13,7 +13,8 @@ import express from 'express';
 
 // The composition root, first: it registers every integration's tools and sources into core, and
 // anything below that reads either registry needs that to have happened already.
-import { directory } from './integrations/registry.js';
+import { directory, dataSource } from './integrations/registry.js';
+import { LEAVE_STATUS, countWithStatus } from './integrations/zoho/people/leaveStatus.js';
 
 import {
   requestId, logger, authenticate, errorHandler, notFound, issueToken,
@@ -27,15 +28,33 @@ import { answer } from './core/orchestrator/index.js';
 import { catalogue } from './core/tools/registry.js';
 import { buildDashboard, available as llmAvailable, modelName } from './core/ai/gemini.js';
 import { keywordSpec } from './core/dashboards/builder.js';
+import { resolveAuthMode } from './core/auth/mode.js';
 
 const dashboards = collection('dashboards');
+
+/** The zoho-mode auth gate until Zoho sign-in exists: no token is accepted, of any kind. */
+const refuseUntilZohoSignIn = (req, res) => res.status(401).json({
+  requestId: req.id, success: false, error: 'Sign-in with Zoho is not configured yet.',
+});
 
 /** Async handlers need their rejections forwarded, or Express swallows them. */
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 const ok = (req, body) => ({ requestId: req.id, success: true, ...body });
 
-export function createApp() {
+/**
+ * Build the app.
+ *
+ * `authMode` is resolved HERE as well as in server.js, deliberately: whatever builds an app —
+ * the server, a test, a future Catalyst handler — gets the same refusals, so no entry point can
+ * produce an app that serves demo login over live data. An explicit `authMode` (tests) goes
+ * through the very same rules; it cannot opt out of them.
+ */
+export function createApp({ authMode } = {}) {
+  const auth = resolveAuthMode(
+    authMode === undefined ? process.env : { ...process.env, NEUIQ_AUTH_MODE: authMode },
+    { dataSource },
+  );
   const app = express();
   app.disable('x-powered-by');
   app.use(express.json({ limit: '256kb' }));
@@ -60,42 +79,62 @@ export function createApp() {
   const api = express.Router();
 
   // ---- health: unauthenticated on purpose, so a probe needs no credentials ----
+  // `dataSource` is 'seed' | 'zoho' | null, nothing else — see publicDataSource(). It is here so
+  // the UI can say "demo data" when it is, instead of assuming a reachable backend means Zoho.
+  // `authMode` is 'demo' | 'zoho' — the word, never the configuration behind it. The employee
+  // count is demo-only: on an unauthenticated endpoint it would publish the real organisation's
+  // headcount to anyone who asks.
   api.get('/health', (req, res) => res.json(ok(req, {
     status: 'up',
     model: llmAvailable() ? modelName() : 'keywords only',
-    employees: directory.count(),
+    ...(auth.isDemo ? { employees: directory.count() } : null),
+    dataSource,
+    authMode: auth.mode,
   })));
 
   // ---- auth ----
-  /**
-   * Demo sign-in: pick a seeded account, get a token. No password check — see the note at the
-   * top of middleware/index.js. `GET /auth/users` exists so the login screen can offer the
-   * roles rather than making you memorise usernames.
-   */
-  api.get('/auth/users', (req, res) => res.json(ok(req, {
-    users: directory.demoAccounts(),
-  })));
+  if (auth.isDemo) {
+    /**
+     * Demo sign-in: pick a seeded account, get a token. No password check — see the note at the
+     * top of middleware/index.js. `GET /auth/users` exists so the login screen can offer the
+     * roles rather than making you memorise usernames.
+     *
+     * Registered ONLY in demo mode, which core/auth/mode.js allows only over seed data and never
+     * in production. In zoho mode these routes do not exist (below).
+     */
+    api.get('/auth/users', (req, res) => res.json(ok(req, {
+      users: directory.demoAccounts(),
+    })));
 
-  api.post('/auth/login', (req, res) => {
-    const username = String(req.body?.username || '').toLowerCase();
-    const employee = directory.byUsername(username);
-    if (!employee) {
-      return res.status(401).json({ requestId: req.id, success: false, error: 'No such account.' });
-    }
-    res.json(ok(req, {
-      token: issueToken(employee),
-      user: {
-        employeeId: employee.employeeId, username: employee.username,
-        name: `${employee.firstName} ${employee.lastName}`, role: employee.role,
-        department: employee.department, isAdmin: isAdmin(employee),
-      },
-    }));
-  });
+    api.post('/auth/login', (req, res) => {
+      const username = String(req.body?.username || '').toLowerCase();
+      const employee = directory.byUsername(username);
+      if (!employee) {
+        return res.status(401).json({ requestId: req.id, success: false, error: 'No such account.' });
+      }
+      res.json(ok(req, {
+        token: issueToken(employee),
+        user: {
+          employeeId: employee.employeeId, username: employee.username,
+          name: `${employee.firstName} ${employee.lastName}`, role: employee.role,
+          department: employee.department, isAdmin: isAdmin(employee),
+        },
+      }));
+    });
+  } else {
+    // Not registered, and answered as such BEFORE the auth gate below — otherwise the gate would
+    // reply 401 and a client could read "this route exists, you just need a token".
+    api.all(['/auth/users', '/auth/login'], notFound);
+  }
 
   // ---- everything below needs a caller ----
-  api.use(authenticate);
+  // In zoho mode there is no way to obtain a valid session yet (OIDC is Phase 5 E5), so every
+  // bearer token is refused — including a demo token minted earlier with the same AUTH_SECRET,
+  // which would otherwise still verify. Nobody is signed in until Zoho sign-in exists.
+  api.use(auth.isDemo ? authenticate : refuseUntilZohoSignIn);
 
-  api.get('/me', (req, res) => res.json(ok(req, { user: { ...req.user, isAdmin: isAdmin(req.user) } })));
+  // dataSource beside the user, not inside it: it describes the backend, not the person.
+  api.get('/me', (req, res) => res.json(ok(req, { user: { ...req.user, isAdmin: isAdmin(req.user) }, dataSource })));
 
   // ---- chat ----
   api.post('/chat', wrap(async (req, res) => {
@@ -126,7 +165,8 @@ export function createApp() {
   api.get('/analytics/summary', wrap(async (req, res) => {
     const scoped = async (spec) => (await runQueryAsync(spec, req.user, { signal: req.signal })).data;
     const leaveDays = (await scoped({ source: 'leave', metric: 'sum', field: 'days' }))[0]?.value ?? 0;
-    const pending = (await scoped({ source: 'leave', groupBy: 'status', metric: 'count' })).find((r) => r.name === 'Pending')?.value ?? 0;
+    // The normalised label, not a literal: live Zoho sends PENDING, which never equalled 'Pending'.
+    const pending = countWithStatus(await scoped({ source: 'leave', groupBy: 'status', metric: 'count' }), LEAVE_STATUS.PENDING);
     // Attendance is unavailable on live data until its transformer exists; a KPI tile must not
     // take the whole summary down with it, so this one degrades to 0 rather than throwing.
     const avgHours = await scoped({ source: 'attendance', metric: 'avg', field: 'hours' })
@@ -136,8 +176,9 @@ export function createApp() {
       kpis: [
         // Headcount is admin-only, so a non-admin sees their own figures rather than a gap -
         // an empty tile reads as broken, and "—" reads as broken-and-hiding-something.
+        // The live directory has no synchronous count (it returns null): say so, not "null".
         isAdmin(req.user)
-          ? { name: 'Headcount', value: String(directory.count()) }
+          ? { name: 'Headcount', value: Number.isInteger(directory.count()) ? String(directory.count()) : 'Unavailable' }
           : { name: 'My department', value: req.user.department },
         { name: 'Leave days', value: String(leaveDays) },
         { name: 'Pending approvals', value: String(pending) },

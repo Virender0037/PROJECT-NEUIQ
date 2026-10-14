@@ -85,3 +85,18 @@ export function describeDataSource(resolved) {
     ? 'seed — generated demo data, not Zoho People'
     : 'zoho — live Zoho People';
 }
+
+/**
+ * The data source as clients may see it: exactly `'seed'`, `'zoho'`, or null.
+ *
+ * What /health and /me report, so the UI can say "demo data" instead of assuming that a reachable
+ * backend means live Zoho data. Deliberately a single word chosen from a closed set: nothing from
+ * the environment passes through, so there is no way for a DC, a client id or any other config
+ * value to reach a response body. Anything it does not recognise is null — "unknown" — never a
+ * guess, and never "zoho".
+ */
+export function publicDataSource(resolved) {
+  if (resolved?.isZoho === true && resolved?.source === ZOHO) return ZOHO;
+  if (resolved?.isSeed === true && resolved?.source === SEED) return SEED;
+  return null;
+}

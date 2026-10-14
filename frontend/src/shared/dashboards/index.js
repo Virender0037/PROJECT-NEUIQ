@@ -8,12 +8,13 @@
  * every screen keeps importing one module. It is separate for one reason: spec.js has no imports
  * at all, which is what lets the whitelist be tested under plain `node`.
  *
- * Everything defined below has the same shape: try the API, and on an UNREACHABLE server (never
- * on a 403) fall back to sample rows and report `source: 'sample'` so the screen can label what
- * you are looking at. A fallback indistinguishable from live data would be worse than an error.
+ * Everything defined below calls the API and reports failure AS failure. Both used to fall back
+ * to sample rows / a sample-built spec when the server was unreachable; that was removed in
+ * Phase 4 — a chart with invented numbers, however labelled, is still invented HR data. The
+ * sample helpers remain in spec.js only for the contract tests, and nothing at runtime calls them.
  */
-import { api, ApiError } from '@shared/api';
-import { sanitize, cleanWidgets, sampleQuery, sampleBuild } from './spec.js';
+import { api } from '@shared/api';
+import { sanitize, cleanWidgets } from './spec.js';
 
 export * from './spec.js';
 
@@ -27,13 +28,10 @@ export * from './spec.js';
 export async function resolveQuery(spec, opts) {
   const clean = sanitize(spec);
   if (!clean) return { data: [], meta: null, source: 'invalid' };
-  try {
-    const res = await api.query(clean, opts);
-    return { ...res, source: 'api' };
-  } catch (err) {
-    if (err instanceof ApiError && err.offline) return { ...sampleQuery(clean), source: 'sample' };
-    throw err;
-  }
+  // Unreachable, 403 and every other failure propagate: the widget shows "unavailable" or "not
+  // permitted", never zero and never sample rows.
+  const res = await api.query(clean, opts);
+  return { ...res, source: 'api' };
 }
 
 /**
@@ -44,13 +42,10 @@ export async function resolveQuery(spec, opts) {
  * how people stop trusting both.
  */
 export async function buildDashboard(prompt) {
-  try {
-    const res = await api.dashboards.build(prompt);
-    // The server whitelisted this already. Doing it again is not distrust of the server, it is
-    // that `widgets` arrives as JSON and this is the last point before it is rendered.
-    return { ...res, widgets: cleanWidgets(res.widgets) };
-  } catch (err) {
-    if (err instanceof ApiError && err.offline) return sampleBuild(prompt);
-    throw err;
-  }
+  // No offline builder: the server's builder is scope-aware (it will not hand an employee an
+  // admin-only widget), the client's sample one was not. A failure is a failure.
+  const res = await api.dashboards.build(prompt);
+  // The server whitelisted this already. Doing it again is not distrust of the server, it is
+  // that `widgets` arrives as JSON and this is the last point before it is rendered.
+  return { ...res, widgets: cleanWidgets(res.widgets) };
 }

@@ -9,13 +9,11 @@
  * bug a user cannot resolve.
  */
 import { API_URL } from '../api/index.js';
+import { profileFor, roleLabel } from './profile.js';
+import { dataSourceInfo } from './dataSource.js';
 
-/** Role ids are stored snake_case; nobody wants to read `hr_admin` in a UI. */
-export const roleLabel = (role) => ({
-  employee: 'Employee',
-  manager: 'Manager',
-  hr_admin: 'HR admin',
-}[role] || role || 'Unknown');
+// roleLabel moved to ./profile.js so the profile and these rows label roles identically.
+export { roleLabel };
 
 /**
  * The rows for the Account section.
@@ -24,19 +22,23 @@ export const roleLabel = (role) => ({
  * will actually enforce — not what the client believes. When the two could differ, the one worth
  * printing is the one that decides whether a query returns rows.
  */
-export function sessionRows({ user, offline }) {
+export function sessionRows({ user, offline, dataSource }) {
   const signedIn = Boolean(user);
+  const me = profileFor(user);
+  // From what the backend REPORTED (dataSource), never from reachability alone: a backend that
+  // answers can still be serving generated demo records.
+  const source = dataSourceInfo({ dataSource, offline });
   return [
     {
       key: 'account',
       label: 'Signed in as',
-      value: signedIn ? user.name : 'Not signed in',
-      hint: signedIn && user.username ? `@${user.username}` : null,
+      value: signedIn ? me.name : 'Not signed in',
+      hint: signedIn && me.username ? `@${me.username}` : null,
     },
     {
       key: 'role',
       label: 'Role',
-      value: signedIn ? roleLabel(user.role) : '—',
+      value: signedIn ? me.role : '—',
       hint: signedIn
         ? user.isAdmin
           ? 'Reads across the organisation'
@@ -55,11 +57,9 @@ export function sessionRows({ user, offline }) {
     {
       key: 'mode',
       label: 'Data',
-      value: offline ? 'Local sample data' : 'Live from the API',
-      hint: offline
-        ? 'Figures on screen are samples, not Zoho People records.'
-        : 'Every figure is re-fetched and re-scoped when you open a screen.',
-      warn: offline,
+      value: source.settings.value,
+      hint: source.settings.hint,
+      warn: source.settings.warn,
     },
   ];
 }

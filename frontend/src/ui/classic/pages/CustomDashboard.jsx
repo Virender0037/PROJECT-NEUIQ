@@ -1,5 +1,7 @@
 import { useState } from 'react';
 import { useApp } from '@shared/context/AppContext.jsx';
+import { CONNECTION, actionFailedMessage, errorState } from '@shared/data/emptyStates.js';
+import EmptyPanel from '../components/EmptyPanel.jsx';
 import El from '@shared/components/El.jsx';
 import Icon from '@shared/icons/Icon.jsx';
 import Widget from '../components/Widget.jsx';
@@ -22,6 +24,8 @@ const BTN_PRIMARY = "display:flex;align-items:center;gap:7px;height:34px;padding
 
 /** Describe a dashboard, preview it live, then save. Nothing is stored until you do. */
 function BuildPanel({ onSaved, onCancel }) {
+  // Provenance from what the backend reports (shared/lib/dataSource.js), never assumed "live".
+  const { dataInfo } = useApp();
   const [prompt, setPrompt] = useState('');
   const [spec, setSpec] = useState(null);
   const [title, setTitle] = useState('');
@@ -38,9 +42,10 @@ function BuildPanel({ onSaved, onCancel }) {
       setSpec(res);
       setTitle(res.title || p.slice(0, 48));
     } catch (err) {
-      // The server's own reason, not a paraphrase. "Couldn't build that" below is for a spec
-      // that came back empty, which is a different problem with a different fix.
-      setFailed(err.message || 'Could not build that dashboard.');
+      // The server's own reason, not a paraphrase — or, with the server unreachable, that it
+      // could not be reached. There is no offline builder any more (Phase 4): it was not
+      // scope-aware, and a dashboard built from nothing is not one to preview.
+      setFailed(actionFailedMessage(err, CONNECTION.buildFailed));
     } finally {
       setBusy(false);
     }
@@ -63,7 +68,7 @@ function BuildPanel({ onSaved, onCancel }) {
         <Icon name="sparkles" size={16} />Build a dashboard
       </div>
       <p style={{ fontSize: 12.5, color: 'var(--text-subtle)', margin: '0 0 12px' }}>
-        Describe what you want to see. It is built from your Zoho People data, scoped to you.
+        {dataInfo.builds}
       </p>
 
       <div style={{ display: 'flex', gap: 9, alignItems: 'flex-start' }}>
@@ -108,9 +113,9 @@ function BuildPanel({ onSaved, onCancel }) {
                 is not the model's work, and passing one off as the other is how people stop
                 trusting both. */}
             <span style={{ fontSize: 11.5, color: 'var(--text-subtle)' }}>
-              {spec.source === 'sample' ? 'built offline'
-                : spec.source === 'fallback' ? 'built from keywords'
-                : 'via ' + spec.source}
+              {spec.source === 'fallback' ? 'built from keywords'
+                : spec.source ? 'via ' + spec.source
+                : 'source not reported'}
             </span>
           </div>
           {/* Live widgets before saving, so a bad spec shows up as an empty chart here rather
@@ -156,7 +161,9 @@ export default function CustomDashboard() {
    *  says nothing is indistinguishable from a broken button. */
   const attempt = async (fn, done) => {
     try { const r = await fn(); app.pushToast(done); return r; }
-    catch (err) { app.pushToast(err.message || 'That did not work.'); return null; }
+    // A change the server did not confirm says so. "Dashboard saved." used to appear for edits
+    // held only in browser memory while the API was down.
+    catch (err) { app.pushToast(actionFailedMessage(err)); return null; }
   };
 
   const onSaved = async (spec) => {
@@ -176,10 +183,6 @@ export default function CustomDashboard() {
           Widgets store the question, not the answer — every figure is re-fetched and re-scoped
           to you when this opens.
         </div>
-        {/* The list came from the seeds, not from the server. Say so where it is read. */}
-        {dash.source === 'sample' && (
-          <span style={{ fontSize: 11, color: 'var(--amber)', fontWeight: 600 }}>sample data</span>
-        )}
         {!building && (
           <El as="button" onClick={() => setBuilding(true)} css={BTN_PRIMARY} hover="filter:brightness(1.06)">
             <Icon name="sparkles" size={16} />New with AI
@@ -215,6 +218,9 @@ export default function CustomDashboard() {
             </div>
           ))}
         </div>
+      ) : dash.error ? (
+        // Unreachable or refused: never "No dashboards yet", which would claim there are none.
+        <EmptyPanel state={errorState(dash.error)} />
       ) : active ? (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 14 }}>
           {active.widgets.map((w, i) => <Widget key={i} widget={w} />)}

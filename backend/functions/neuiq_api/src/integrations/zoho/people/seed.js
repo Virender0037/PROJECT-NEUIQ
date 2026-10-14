@@ -15,6 +15,7 @@
  * consumer. Verify them against the live API when the sandbox exists — see
  * docs/backend/05-zoho-people-integration.md.
  */
+import { LEAVE_STATUS, isApprovedLeave } from './leaveStatus.js';
 
 /** The clock the seed is built against. Fixed so warranty-style relative figures stay stable. */
 export const NOW = new Date('2026-09-04T00:00:00.000Z');
@@ -41,7 +42,8 @@ export const LOCATIONS = ['Pune', 'Bengaluru', 'Remote'];
 export const DESIGNATIONS = ['Engineer', 'Senior Engineer', 'Lead', 'Manager', 'Analyst', 'Executive'];
 export const EMPLOYMENT_TYPES = ['Permanent', 'Contract', 'Intern'];
 export const LEAVE_TYPES = ['Casual', 'Sick', 'Earned', 'Unpaid'];
-export const LEAVE_STATUSES = ['Approved', 'Pending', 'Rejected'];
+/** The seed's statuses ARE the normalised vocabulary (leaveStatus.js), so seed and live group alike. */
+export const LEAVE_STATUSES = [LEAVE_STATUS.APPROVED, LEAVE_STATUS.PENDING, LEAVE_STATUS.REJECTED];
 export const ATTENDANCE_STATUSES = ['Present', 'Remote', 'On leave', 'Absent'];
 
 /**
@@ -119,7 +121,7 @@ export function buildSeed() {
         departmentId: e.department,
         leaveType: pick(r, LEAVE_TYPES),
         // Weighted towards Approved: a queue that is 1/3 rejected is not a realistic org.
-        status: r() < 0.78 ? 'Approved' : pick(r, ['Pending', 'Rejected']),
+        status: r() < 0.78 ? LEAVE_STATUS.APPROVED : pick(r, [LEAVE_STATUS.PENDING, LEAVE_STATUS.REJECTED]),
         days: pick(r, [0.5, 1, 1, 1, 2, 3, 5]),
         from: d.toISOString().slice(0, 10),
         month: d.toISOString().slice(0, 7),
@@ -152,11 +154,13 @@ export function buildSeed() {
 }
 
 /** Who is out today. Derived rather than stored, so it can never disagree with the leave rows. */
-export function onLeaveToday(seed) {
+export function onLeaveToday(seed, { include = () => true } = {}) {
   const today = NOW.toISOString().slice(0, 10);
   const month = today.slice(0, 7);
   return seed.leave
-    .filter((l) => l.status === 'Approved' && l.month === month)
+    // `include` runs BEFORE the cap: filtering after it would let six people the caller may not
+    // see crowd out the ones they may, and report "nobody" when that is not true.
+    .filter((l) => isApprovedLeave(l) && l.month === month && include(l.employeeId))
     .slice(0, 6)
     .map((l) => {
       const e = seed.employees.find((x) => x.employeeId === l.employeeId);

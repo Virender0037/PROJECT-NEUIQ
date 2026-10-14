@@ -23,19 +23,33 @@
  * over a network.
  */
 import { resolveSubject } from '../../../../core/policy/authorize.js';
-import { PEOPLE_TOOLS } from './index.js';
+import {
+  PEOPLE_TOOLS, PERSON_FIELDS, ON_LEAVE_FIELDS, LEAVE_RECORD_FIELDS, pick,
+} from './index.js';
+import { teamOf, isWithin } from '../../../../core/policy/authorize.js';
+import { isApprovedLeave, matchesLeaveStatus } from '../leaveStatus.js';
 import { transformLeaveRecords } from '../transformers/leave.js';
 import { transformEmployeeRecords } from '../transformers/employee.js';
 import { AttendanceTransformerPendingError } from '../transformers/attendance.js';
+import {
+  transformLeaveBalanceReport, isZohoRecordId, LeaveBalanceUnavailableError, BALANCE_UNAVAILABLE,
+} from '../transformers/balance.js';
+import { leaveBalancePeriod, LEAVE_YEAR_ENV } from '../leaveYear.js';
 import { defaultWindow } from '../sources.live.js';
+import { cache as sharedCache, cacheKey } from '../../../../core/platform/cache.js';
 
-/** Entitlements are org policy, not an API field. Same table the seed tools use. */
-const ENTITLEMENT = { Casual: 12, Sick: 8, Earned: 15, Unpaid: 0 };
+/** A balance changes when leave is booked or approved — minutes, not seconds, is fresh enough. */
+export const BALANCE_TTL_SECONDS = 300;
 
 /** Reuse the seed tool's declaration, replace only its body. Keeps the contract identical. */
 const from = (name, run) => ({ ...PEOPLE_TOOLS[name], run });
 
-export function buildLiveTools({ client, now = () => new Date() }) {
+export function buildLiveTools({
+  client,
+  now = () => new Date(),
+  leaveYearStart = undefined,
+  balanceCache = sharedCache,
+}) {
   /** Leave rows for one employee over the default window, already normalized. */
   async function leaveFor(employeeId, signal) {
     const { from: f, to } = defaultWindow(now());
@@ -44,30 +58,68 @@ export function buildLiveTools({ client, now = () => new Date() }) {
   }
 
   return {
+    /**
+     * Leave balance — Zoho's own figure from the Booked and Balance report. Nothing is computed.
+     *
+     * This replaced a balance summed from leave requests against INVENTED entitlement constants
+     * ({Casual: 12, Sick: 8, ...}) that matched none of the organisation's real leave types. It
+     * fails closed at every step, and every refusal happens before a request is made:
+     *
+     *   1. resolveSubject   who may be asked about — the existing rule, unchanged. A chat argument
+     *                       only ever selects among ids the caller is already allowed to see.
+     *   2. isZohoRecordId   the subject must be a Zoho erecno (__recordId). A seed id, an email or
+     *                       a rounded number is refused: NOT_LINKED.
+     *   3. period           the configured leave year (leaveYear.js). Unset: PERIOD_NOT_CONFIGURED.
+     *   4. cache            keyed by caller, subject and period — never shared across any of them.
+     *   5. client           one employee, rate-limited, no 5xx retry.
+     *   6. transformer      anything incomplete is unavailable, never zero.
+     *
+     * On any failure the error surfaces. There is no fallback figure, seed or otherwise.
+     */
     'zohoPeople.leaveBalance': from('zohoPeople.leaveBalance', async ({ employeeId, leaveType }, user) => {
       const id = resolveSubject(user, employeeId);
-      const rows = await leaveFor(id);
-      const year = String(now().getUTCFullYear());
-      const types = leaveType ? [leaveType] : Object.keys(ENTITLEMENT);
-      const balances = types.map((type) => {
-        const taken = rows
-          .filter((l) => l.leaveType === type && l.status === 'Approved' && String(l.month || '').startsWith(year))
-          .reduce((s, l) => s + l.days, 0);
-        const entitled = ENTITLEMENT[type] ?? 0;
-        return { leaveType: type, entitled, taken: Math.round(taken * 10) / 10, remaining: Math.round((entitled - taken) * 10) / 10 };
-      });
-      return { employeeId: id, year, balances };
+      if (!isZohoRecordId(id)) {
+        throw new LeaveBalanceUnavailableError(BALANCE_UNAVAILABLE.NOT_LINKED, 'this account is not linked to a Zoho People employee record.');
+      }
+      const period = leaveBalancePeriod(leaveYearStart, now());
+      if (!period) {
+        throw new LeaveBalanceUnavailableError(
+          BALANCE_UNAVAILABLE.PERIOD_NOT_CONFIGURED,
+          `the organisation's leave year is not configured. Set ${LEAVE_YEAR_ENV}=MM-DD (e.g. 01-01 or 04-01).`,
+        );
+      }
+
+      // Caller AND subject AND period: a manager's cached view of a report never answers the
+      // report themselves, and last leave year's figures never answer this one.
+      const key = cacheKey(user.employeeId, 'leave-balance', id, period.from, period.to);
+      const rows = await balanceCache.wrap(key, BALANCE_TTL_SECONDS, async () => transformLeaveBalanceReport(
+        await client.leaveBalance({ employeeId: id, from: period.from, to: period.to }),
+        { employeeId: id },
+      ));
+
+      const wanted = leaveType ? String(leaveType).trim().toLowerCase() : null;
+      const balances = rows
+        .filter((r) => !wanted || r.leaveType.toLowerCase() === wanted)
+        .map((r) => pick(r, ['leaveType', 'category', 'unit', 'balance', 'booked']));
+
+      return {
+        employeeId: id,
+        dataSource: 'zoho',
+        period,
+        requestedLeaveType: leaveType || null,
+        balances,
+      };
     }),
 
     'zohoPeople.leaveRecords': from('zohoPeople.leaveRecords', async ({ employeeId, status, limit }, user) => {
       const id = resolveSubject(user, employeeId);
       let rows = await leaveFor(id);
-      if (status) rows = rows.filter((l) => String(l.status).toLowerCase() === String(status).toLowerCase());
+      if (status) rows = rows.filter((l) => matchesLeaveStatus(l, status));
       rows = rows.sort((a, b) => String(b.from).localeCompare(String(a.from))).slice(0, Math.min(Number(limit) || 10, 50));
       return {
         employeeId: id,
         count: rows.length,
-        records: rows.map((l) => ({ leaveType: l.leaveType, status: l.status, days: l.days, from: l.from })),
+        records: rows.map((l) => pick(l, LEAVE_RECORD_FIELDS)),
       };
     }),
 
@@ -80,14 +132,24 @@ export function buildLiveTools({ client, now = () => new Date() }) {
       throw new AttendanceTransformerPendingError();
     }),
 
+    /**
+     * The caller's direct reports, or everyone for an HR admin.
+     *
+     * The leave request goes out as `data_select=ALL`, so this filter is the only thing between a
+     * manager and the whole organisation's absences — Zoho narrows nothing. `teamOf` runs BEFORE
+     * the fetch, so a caller whose team cannot be determined (all of live mode, until a reporting
+     * field is confirmed) is refused without a request being made.
+     */
     'zohoPeople.teamOnLeave': from('zohoPeople.teamOnLeave', async (_args, user) => {
+      const team = teamOf(user);
       const today = now().toISOString().slice(0, 10);
       const { from: f, to } = defaultWindow(now());
       const raw = await client.leaves({ from: f, to, user, signal: undefined });
       const people = transformLeaveRecords(raw)
-        .filter((l) => l.status === 'Approved' && l.from <= today && (l.to ?? l.from) >= today)
+        .filter((l) => isWithin(team, l.employeeId))
+        .filter((l) => isApprovedLeave(l) && l.from <= today && (l.to ?? l.from) >= today)
         .slice(0, 6)
-        .map((l) => ({ employeeId: l.employeeId, name: l.employeeName || l.employeeId, leaveType: l.leaveType, days: l.days }));
+        .map((l) => pick({ ...l, name: l.employeeName || l.employeeId }, ON_LEAVE_FIELDS));
       return { date: today, people };
     }),
 
@@ -124,20 +186,18 @@ export function buildLiveTools({ client, now = () => new Date() }) {
      * result carries the email in `name`: printing a blank where a person's name belongs would be
      * worse than printing the address we actually have.
      */
-    'zohoPeople.employeeLookup': from('zohoPeople.employeeLookup', async ({ name }, _user) => {
+    'zohoPeople.employeeLookup': from('zohoPeople.employeeLookup', async ({ name }, user) => {
+      // Yourself and your direct reports, or everyone for an HR admin. Decided before the fetch.
+      const reach = teamOf(user, { includeSelf: true });
       const q = String(name).toLowerCase();
       const rows = transformEmployeeRecords(await client.employees({}));
       const hits = rows
+        .filter((e) => isWithin(reach, e.recordId))
         .filter((e) => String(e.email ?? '').toLowerCase().includes(q))
         .slice(0, 5)
-        .map((e) => ({
-          employeeId: e.recordId,
-          // The email stands in for the name until a name field is confirmed.
-          name: e.email,
-          department: e.department,
-          designation: null,
-          location: null,
-        }));
+        // The email stands in for the name until a name field is confirmed. designation and
+        // location come out null: no such field is mapped, and PERSON_FIELDS fixes the shape.
+        .map((e) => pick({ ...e, employeeId: e.recordId, name: e.email }, PERSON_FIELDS));
       return { query: name, count: hits.length, employees: hits, matchedOn: 'email' };
     }),
   };

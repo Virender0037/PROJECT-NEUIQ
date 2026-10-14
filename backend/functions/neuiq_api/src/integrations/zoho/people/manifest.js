@@ -18,11 +18,12 @@
 import { PEOPLE_SOURCES } from './sources.js';
 import { PEOPLE_TOOLS } from './tools/index.js';
 import { directory } from './directory.js';
-import { resolveDataSource } from './dataSource.js';
+import { resolveDataSource, publicDataSource } from './dataSource.js';
 import { configFromEnv, createTokenProvider, isConfigured } from '../_shared/auth.service.js';
 import { createPeopleClient } from './client.js';
 import { buildLiveSources } from './sources.live.js';
 import { buildLiveTools } from './tools/live.js';
+import { createEmployeeDirectory } from './employeeDirectory.js';
 
 /**
  * Build the manifest for the configured data source.
@@ -38,6 +39,9 @@ export function buildPeopleManifest(env = process.env) {
     product: 'people',
     label: 'Zoho People',
     dataSource: resolved.source,
+    // 'seed' | 'zoho' | null, from the SAME resolution that chose the sources and tools below —
+    // what /health and /me report, so the UI never has to infer it from reachability.
+    publicDataSource: publicDataSource(resolved),
     directory,
   };
 
@@ -61,34 +65,51 @@ export function buildPeopleManifest(env = process.env) {
   return {
     ...base,
     sources: buildLiveSources({ client }),
-    tools: buildLiveTools({ client }),
+    // The leave-year start is read here, at boot, like everything else that decides live
+    // behaviour. Unset is allowed: leaveBalance then refuses as unavailable rather than guessing.
+    tools: buildLiveTools({ client, leaveYearStart: env.ZOHO_PEOPLE_LEAVE_YEAR_START }),
     directory: liveDirectory,
+    // Built and cached here, CONNECTED TO NOTHING YET: identity mapping and roles use it from
+    // E3/E5. Loads through the same service-account client as every other live read.
+    employeeDirectory: createEmployeeDirectory({
+      loadRecords: () => client.employees(),
+      logger: {
+        info: (o) => console.log(JSON.stringify(o)),
+        warn: (o) => console.warn(JSON.stringify(o)),
+      },
+    }),
     client,
     tokenProvider,
   };
 }
 
 /**
- * The directory in live mode, with the reporting hierarchy switched OFF.
+ * The synchronous directory interface in live mode — and NOTHING from the seed.
  *
- * No manager or reporting field appeared in the captured employee payload, so there is nothing to
- * build a manager -> direct-reports relationship from. The seed HAS such a relationship, and
- * leaving it wired up in live mode would be the worst of both: `resolveSubject` would let a
- * manager read a "direct report" chosen by generated demo data that has no connection to the real
- * org chart. That is an authorization decision made from fabricated input.
+ * This used to be `{ ...directory, byId, reportsOf }`: a spread of the SEED directory with two
+ * methods overridden. Every method not overridden — `resolve` (who a token belongs to),
+ * `byUsername`, `demoAccounts`, `count` — was still the seed's, so a seed identity could have been
+ * resolved against live Zoho data. (Phase 5.3 removed the spread.)
  *
- * So `byId` returns null. `resolveSubject` then finds no subject to match against and throws 403 —
- * it fails CLOSED. Reading yourself still works, and an admin still reads anyone, because both of
- * those paths return before the directory is consulted. What is refused is exactly the case that
- * cannot currently be decided correctly.
+ * Every member is now explicit, and every identity question is REFUSED: there is no live sign-in
+ * yet (Phase 5 E5), and the Phase 5.2 gate refuses every token in zoho mode anyway. The real
+ * answers come from the async employee directory (employeeDirectory.js), attached to the manifest
+ * below as `employeeDirectory` and wired into identity and authorization in E3/E5 — not here.
  *
- * This is restored by confirming a reporting field on the employee form, not by writing code.
+ *   resolve      -> null   a token resolves to nobody (401)
+ *   byId         -> null   no subject, so resolveSubject refuses team reads (403)
+ *   reportsOf    -> []     and the hierarchy is off, so authorize.js never reads it
+ *   count        -> null   no headcount from here (the summary shows it as unavailable)
  */
-const liveDirectory = {
-  ...directory,
+const liveDirectory = Object.freeze({
+  resolve: () => null,
+  byUsername: () => null,
+  demoAccounts: () => [],
   byId: () => null,
+  reportsOf: () => [],
+  count: () => null,
   hierarchyAvailable: false,
-};
+});
 
 /** The manifest for this process. */
 export default buildPeopleManifest();

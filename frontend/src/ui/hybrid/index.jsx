@@ -5,6 +5,7 @@ import './styles/neuiq.css';   // NeuIQ-only additions, loaded after the design 
 import GridBackground from './components/GridBackground.jsx';
 import Dock from './components/Dock.jsx';
 import TopBar from './components/TopBar.jsx';
+import DataSourceBanner from './components/DataSourceBanner.jsx';
 import Composer from './components/Composer.jsx';
 import Toasts from './components/Toasts.jsx';
 import { applyTheme } from '@shared/lib/theme.js';
@@ -74,6 +75,7 @@ export default function HybridUI() {
 
         <div className="app-scroll">
           <TopBar view={view} />
+          <DataSourceBanner />
           <main id="main" className="page" tabIndex={-1}>
             {/* keyed on the view so the enter animation replays on every navigation */}
             <div className="route-view" key={view}>

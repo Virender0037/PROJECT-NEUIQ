@@ -66,20 +66,42 @@ function Block({ b }) {
  *
  * This is not decoration. Every figure in this product is somebody's leave or hours, and the
  * first question anyone asks of such a number is "is that actually from Zoho?". The tool name
- * answers it, and `sample` answers it in the other direction — that this one is not.
+ * answers it. (The `sample` pill that marked canned offline answers went with them in Phase 4.)
  */
 export function AnswerMeta({ meta }) {
   if (!meta) return null;
   const bits = [];
   if (meta.tool) bits.push(meta.tool);
-  if (meta.source && meta.source !== 'sample' && meta.source !== 'guard') bits.push('routed by ' + meta.source);
+  if (meta.source && meta.source !== 'guard') bits.push('routed by ' + meta.source);
   if (meta.outcome === 'refused') bits.push('refused');
   if (meta.outcome === 'stopped') bits.push('stopped');
-  if (!bits.length && meta.source !== 'sample') return null;
+  if (!bits.length) return null;
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: -6, marginBottom: 10, fontSize: 11.5, color: 'var(--ink-dim)' }}>
-      {meta.source === 'sample' && <span className="dw-tag">sample</span>}
-      {bits.length > 0 && <code style={{ fontSize: 11.5 }}>{bits.join(' · ')}</code>}
+      <code style={{ fontSize: 11.5 }}>{bits.join(' · ')}</code>
+    </div>
+  );
+}
+
+/**
+ * A question that could not be sent — NOT an assistant reply.
+ *
+ * Rendered without the assistant's avatar or its copy / like / pin actions, because nothing was
+ * answered. It replaced a canned reply typed out as if the assistant had spoken. Retry takes the
+ * failed attempt back out and sends the question again.
+ */
+export function ChatNotice({ notice }) {
+  const app = useApp();
+  return (
+    <div className="dw-empty" role="alert" data-notice-kind={notice.kind}
+      style={{ display: 'flex', alignItems: 'center', gap: 10, textAlign: 'left', marginBottom: 12 }}>
+      <Icon name="help" size={16} />
+      <span style={{ flex: 1, minWidth: 0 }}>{notice.text}</span>
+      {notice.retryText && (
+        <button className="btn ghost" onClick={() => app.retryMessage(notice)} style={{ padding: '6px 11px', fontSize: 12.5 }}>
+          <Icon name="refresh" size={14} />Retry
+        </button>
+      )}
     </div>
   );
 }

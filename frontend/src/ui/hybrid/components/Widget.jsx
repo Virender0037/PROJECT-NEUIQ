@@ -1,5 +1,6 @@
 import { LineChart, PieChart, BarChart, fmt } from '@shared/components/charts.jsx';
 import { useKpis, useWidgetRows } from '@shared/dashboards/useWidget.js';
+import { errorState } from '@shared/data/emptyStates.js';
 
 /**
  * Widget — renders one widget SPEC by running its query, never by reading a stored value.
@@ -36,27 +37,28 @@ const Skeleton = ({ title }) => (
  * "something went wrong". Substituting sample numbers here would misrepresent someone's access,
  * which is the one failure this app must never have.
  */
-const Failed = ({ title, error }) => (
-  <Card title={title}>
-    <div className="dw-empty">
-      {error?.status === 403 ? 'Not available on your account.' : error?.message || 'Could not load this widget.'}
-    </div>
-  </Card>
-);
+const Failed = ({ title, error }) => {
+  // Shared wording (shared/data/emptyStates.js) so Hybrid and Classic classify a failure alike:
+  // a 403 is "not permitted", an unreachable server is "API unavailable" — never a zero, never
+  // sample figures. (Offline sample tiles, with their SAMPLE tag, were removed in Phase 4.)
+  const s = errorState(error);
+  return (
+    <Card title={title}>
+      <div className="dw-empty" role="status" data-state-kind={s.kind}>
+        {s.title}{s.body ? ` ${s.body}` : ''}
+      </div>
+    </Card>
+  );
+};
 
-/** The "these are not real figures" marker, shown only when the API could not be reached. */
-const SampleTag = () => (
-  <span className="dw-tag" title="The API is unreachable — showing sample figures">sample</span>
-);
-
-const head = (title, source) => <>{title}{source === 'sample' && <SampleTag />}</>;
+const head = (title) => <>{title}</>;
 
 function KpiWidget({ title }) {
-  const { data, loading, error, source } = useKpis();
+  const { data, loading, error } = useKpis();
   if (loading) return <Skeleton title={title} />;
   if (error) return <Failed title={title} error={error} />;
   return (
-    <Card title={head(title, source)} wide>
+    <Card title={head(title)} wide>
       <div className="dw-kpis">
         {data.kpis.map((k) => (
           <div className="dw-kpi" key={k.name}>
@@ -70,11 +72,11 @@ function KpiWidget({ title }) {
 }
 
 function QueryWidget({ widget, title }) {
-  const { rows, loading, error, source } = useWidgetRows(widget);
+  const { rows, loading, error } = useWidgetRows(widget);
   if (loading) return <Skeleton title={title} />;
   if (error) return <Failed title={title} error={error} />;
 
-  const h = head(title, source);
+  const h = head(title);
   if (!rows.length) return <Card title={h}><div className="dw-empty">No data.</div></Card>;
 
   if (widget.type === 'table') {

@@ -18,7 +18,9 @@
 export function validateArgsFor(schema, args = {}, toolName = 'tool') {
   const out = {};
   for (const [key, value] of Object.entries(args)) {
-    if (!(key in schema)) {
+    // Own keys only. `in` also matches inherited names, so "__proto__", "constructor" or
+    // "toString" from a model or an injected prompt would pass as known parameters.
+    if (!Object.hasOwn(schema, key)) {
       const e = new Error(`Unknown parameter "${key}" for ${toolName}`);
       e.status = 400;
       throw e;

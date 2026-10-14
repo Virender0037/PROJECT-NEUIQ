@@ -2,8 +2,9 @@ import { useApp } from '@shared/context/AppContext.jsx';
 import Icon from '@shared/icons/Icon.jsx';
 import Logo from '@shared/icons/Logo.jsx';
 import { useApi, api } from '@shared/api';
-import { SOURCES, schemaFor } from '@shared/dashboards';
-import { SEED_AI_ACTIVITY } from '@shared/data/seedDashboards.js';
+import { SOURCES } from '@shared/dashboards';
+import { EMPTY, errorState } from '@shared/data/emptyStates.js';
+import EmptyPanel from '../components/EmptyPanel.jsx';
 
 /**
  * AI — what the assistant can actually do, stated plainly.
@@ -68,19 +69,9 @@ export default function Ai() {
    * the narrower role — enough to demo, and labelled so it is not mistaken for the server's
    * answer about this account.
    */
-  const { data, loading, source } = useApi(
-    (signal) => api.capabilities({ signal }),
-    [],
-    {
-      fallback: () => ({
-        model: null,
-        routing: 'keywords only',
-        readOnly: true,
-        tools: [],
-        sources: schemaFor({ isAdmin: false }),
-      }),
-    },
-  );
+  // No fallback (Phase 4): an unreachable server used to produce a client-side capability list,
+  // labelled "sample". Now the page says the API is unavailable and lists nothing it was not told.
+  const { data, loading, error } = useApi((signal) => api.capabilities({ signal }), []);
 
   const tools = [...(data?.tools || []), BUILDER_CARD];
   const schema = data?.sources || [];
@@ -88,12 +79,14 @@ export default function Ai() {
   return (
     <div className="view">
       <div className="page-head">
-        <h1>AI {source === 'sample' && <span className="dw-tag">sample</span>}</h1>
+        <h1>AI</h1>
         <p>
           What the assistant can reach, and what it will not do.
           {data && <> Routing: <strong>{data.routing}</strong>{data.readOnly && ' · read-only'}.</>}
         </p>
       </div>
+
+      {error && <div style={{ marginBottom: 16 }}><EmptyPanel state={errorState(error)} /></div>}
 
       <div className="dw-card wide" style={{ display: 'flex', gap: 16, alignItems: 'flex-start', marginBottom: 16 }}>
         <span className="chat-ava" style={{ width: 44, height: 44, flex: '0 0 auto' }}><Logo size={22} /></span>
@@ -157,22 +150,11 @@ export default function Ai() {
         </div>
       </div>
 
+      {/* There is no activity log yet. This used to list invented HR questions ("Answered 'who
+          is on leave today'", "2 days ago") beside the real capability catalogue above, with
+          nothing to tell them apart. */}
       <div className="neuiq-group-label">Recent activity</div>
-      <div className="dw-card">
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-          {SEED_AI_ACTIVITY.map((a) => (
-            <div key={a.text} style={{ display: 'flex', gap: 11, alignItems: 'flex-start' }}>
-              <span className="k-icon" style={{ width: 28, height: 28 }}><Icon name={a.icon} size={15} /></span>
-              <div style={{ minWidth: 0, flex: 1 }}>
-                <div style={{ fontSize: 13, lineHeight: 1.4 }}>{a.text}</div>
-                <div style={{ fontSize: 11.5, color: 'var(--ink-dim)', marginTop: 1 }}>
-                  {a.tool} · {a.time}
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
+      <EmptyPanel state={EMPTY.aiActivity} />
 
       <div className="neuiq-group-label">What it will not do</div>
       <div className="dw-card">
