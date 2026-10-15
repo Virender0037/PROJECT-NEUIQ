@@ -81,6 +81,21 @@ export function cacheKey(callerId, ...parts) {
   return [callerId, ...parts.map(stable)].join('|');
 }
 
+/**
+ * A cache key that is ALSO partitioned by deployment namespace (E2.2).
+ *
+ * In one process the namespace is fixed (core/platform/deployment.js), so today this only adds a
+ * prefix. It is what keeps the rule true when the in-memory map becomes a shared Catalyst Cache
+ * that test and production could both reach: no entry from one deployment is ever a hit in another.
+ * Both the namespace and the caller are required — neither may silently be absent.
+ */
+export function scopedCacheKey(namespace, callerId, ...parts) {
+  if (typeof namespace !== 'string' || !namespace) {
+    throw new Error('cache: a cache key must include the deployment namespace — an unpartitioned key can cross environments');
+  }
+  return `${namespace}#${cacheKey(callerId, ...parts)}`;
+}
+
 /** Stable stringification, so key order in an object cannot change the key. */
 function stable(part) {
   if (part == null) return '';

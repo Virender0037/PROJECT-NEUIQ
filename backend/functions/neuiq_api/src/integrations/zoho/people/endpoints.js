@@ -1,8 +1,10 @@
 /**
  * Zoho People endpoints, recorded as evidence rather than intent.
  *
- * Same discipline as _shared/scopes.js: what is written here has actually returned 200 against
- * the client's India tenant. Documented-but-untried parameters are listed separately and are not
+ * Same discipline as _shared/scopes.js: what is written here has actually returned 200 — against
+ * the India organisation by curl (2026-09-07), and/or the approved .com development/test
+ * organisation through this code (2026-10-13/14), as each entry says. Neither organisation is a
+ * confirmed production organisation. Documented-but-untried parameters are listed separately and are not
  * used, because the one time this project reasoned a value out from documentation
  * (`ZohoPeople.leave.READ`) it was wrong in both casing and granularity.
  *
@@ -34,7 +36,7 @@ export const CONFIRMED_ENDPOINTS = {
     method: 'GET',
     path: '/people/api/v3/leave-tracker/leaves',
     envelope: 'v3',
-    scopeKey: 'people.leave.read',      // still PENDING in scopes.js — see note below
+    scopeKey: 'people.leave.read',      // granted on the .com test organisation, 2026-10-13 (scopes.js)
     confirmedOn: '2026-09-07',
     confirmedParams: ['from_date', 'to_date', 'date_format', 'data_select'],
   },

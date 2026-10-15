@@ -20,10 +20,13 @@ import { PEOPLE_TOOLS } from './tools/index.js';
 import { directory } from './directory.js';
 import { resolveDataSource, publicDataSource } from './dataSource.js';
 import { configFromEnv, createTokenProvider, isConfigured } from '../_shared/auth.service.js';
+import { resolveZohoDc } from '../_shared/datacenters.js';
 import { createPeopleClient } from './client.js';
 import { buildLiveSources } from './sources.live.js';
 import { buildLiveTools } from './tools/live.js';
 import { createEmployeeDirectory } from './employeeDirectory.js';
+import { createEmployeeSnapshot } from './employeeSnapshot.js';
+import { currentNamespace } from '../../../core/platform/deployment.js';
 
 /**
  * Build the manifest for the configured data source.
@@ -58,26 +61,39 @@ export function buildPeopleManifest(env = process.env) {
       + 'Set ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET and ZOHO_REFRESH_TOKEN — see backend/.env.example.',
     );
   }
+  // ZOHO_DC is required, never defaulted (S2) — the same rule the startup profile applies, so a
+  // manifest built by any entry point refuses identically.
+  const dc = resolveZohoDc(env).code;
 
-  const tokenProvider = createTokenProvider({ config });
-  const client = createPeopleClient({ dc: config.dc, tokenProvider });
+  const tokenProvider = createTokenProvider({ config: { ...config, dc } });
+  const client = createPeopleClient({ dc, tokenProvider });
+  const logger = {
+    info: (o) => console.log(JSON.stringify(o)),
+    warn: (o) => console.warn(JSON.stringify(o)),
+  };
+  // ONE employee snapshot for every consumer in this process (E2.2): the identity directory, the
+  // `employees` source, `headcount` and `employeeLookup` share a single paged load instead of each
+  // walking Zoho. Its namespace is read from the bound deployment AT REQUEST TIME — before
+  // createApp() has bound one, every read is refused.
+  const employeeSnapshot = createEmployeeSnapshot({
+    loadRecords: () => client.employees(),
+    namespace: currentNamespace,
+    logger,
+  });
 
   return {
     ...base,
-    sources: buildLiveSources({ client }),
+    sources: buildLiveSources({ client, employeeSnapshot, namespace: currentNamespace }),
     // The leave-year start is read here, at boot, like everything else that decides live
     // behaviour. Unset is allowed: leaveBalance then refuses as unavailable rather than guessing.
-    tools: buildLiveTools({ client, leaveYearStart: env.ZOHO_PEOPLE_LEAVE_YEAR_START }),
-    directory: liveDirectory,
-    // Built and cached here, CONNECTED TO NOTHING YET: identity mapping and roles use it from
-    // E3/E5. Loads through the same service-account client as every other live read.
-    employeeDirectory: createEmployeeDirectory({
-      loadRecords: () => client.employees(),
-      logger: {
-        info: (o) => console.log(JSON.stringify(o)),
-        warn: (o) => console.warn(JSON.stringify(o)),
-      },
+    tools: buildLiveTools({
+      client, employeeSnapshot, namespace: currentNamespace, leaveYearStart: env.ZOHO_PEOPLE_LEAVE_YEAR_START,
     }),
+    directory: liveDirectory,
+    // CONNECTED TO NOTHING YET: identity mapping and roles use it from E3/E5. It indexes the SAME
+    // shared snapshot the other consumers read.
+    employeeDirectory: createEmployeeDirectory({ snapshot: employeeSnapshot, namespace: currentNamespace, logger }),
+    employeeSnapshot,
     client,
     tokenProvider,
   };

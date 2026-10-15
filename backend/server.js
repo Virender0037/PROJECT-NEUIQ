@@ -5,30 +5,39 @@
  * Advanced I/O runtime. Everything that decides anything lives under functions/neuiq_api/src,
  * so that swap is a few lines and touches no logic.
  */
-import { createApp } from './functions/neuiq_api/src/app.js';
 import {
   assertBootable, describeDataSource, publicDataSource,
 } from './functions/neuiq_api/src/integrations/zoho/people/dataSource.js';
-import { resolveAuthMode, describeAuthMode } from './functions/neuiq_api/src/core/auth/mode.js';
+import { describeAuthMode } from './functions/neuiq_api/src/core/auth/mode.js';
+import { resolveEnvironmentProfile, describeEnvironment } from './functions/neuiq_api/src/core/platform/environment.js';
+import { ENVIRONMENT_CHECKS } from './functions/neuiq_api/src/integrations/environmentChecks.js';
 
 const PORT = Number(process.env.PORT) || 4200;
 
 /**
- * The data source is decided here, once, before anything listens.
+ * The whole deployment profile is decided here, once, before anything listens — and before the
+ * app is even loaded.
  *
- * In production with the seed selected this throws and the process exits non-zero, because a
- * server that starts and then serves generated demo records as real HR figures is worse than one
- * that refuses to start. Nothing downstream can change the decision at request time.
+ * In production with the seed selected, `assertBootable()` throws and the process exits non-zero,
+ * because a server that starts and then serves generated demo records as real HR figures is worse
+ * than one that refuses to start. The environment profile then applies every other startup rule:
+ * sign-in mode, NEUIQ_ENV, the Zoho data centre and the signing secret. createApp() re-resolves
+ * the same profile, so this is the clean exit, not the only guard.
+ *
+ * The app is imported only AFTER the profile is accepted. Importing it builds the integration
+ * manifests, and a live manifest reads credentials; a configuration this process refuses must
+ * fail with a one-line reason here, not with a stack trace from inside an import.
  */
 let dataSource;
-let authMode;
+let profile;
 let app;
 try {
   dataSource = assertBootable();
-  // How callers sign in is decided here too, against the data source just resolved: demo login
-  // is refused over anything but seed data, and in production. createApp() re-checks the same
-  // rules, so this is the clean exit, not the only guard.
-  authMode = resolveAuthMode(process.env, { dataSource: publicDataSource(dataSource) });
+  profile = resolveEnvironmentProfile(process.env, {
+    dataSource: publicDataSource(dataSource),
+    integrationChecks: ENVIRONMENT_CHECKS,
+  });
+  const { createApp } = await import('./functions/neuiq_api/src/app.js');
   app = createApp();
 } catch (err) {
   console.error(`NeuIQ API refused to start: ${err.message}`);
@@ -41,7 +50,9 @@ app.listen(PORT, () => {
   // silently proxies to the other app's API.
   console.log(`NeuIQ API on http://localhost:${PORT}/api/v1`);
   console.log(process.env.GEMINI_API_KEY ? 'Gemini: configured' : 'Gemini: not configured — routing via keywords');
-  // Whoever reads this line is deciding whether to trust the numbers on their screen.
+  // Whoever reads these lines is deciding whether to trust the numbers on their screen.
+  console.log(`Environment: ${describeEnvironment(profile)}`);
   console.log(`Data: ${describeDataSource(dataSource)}`);
-  console.log(`Auth: ${describeAuthMode(authMode)}`);
+  if (profile.integrations.zohoDc) console.log(`Zoho data centre: ${profile.integrations.zohoDc}`);
+  console.log(`Auth: ${describeAuthMode(profile.auth)}`);
 });

@@ -28,9 +28,9 @@ import { answer } from './core/orchestrator/index.js';
 import { catalogue } from './core/tools/registry.js';
 import { buildDashboard, available as llmAvailable, modelName } from './core/ai/gemini.js';
 import { keywordSpec } from './core/dashboards/builder.js';
-import { resolveAuthMode } from './core/auth/mode.js';
-
-const dashboards = collection('dashboards');
+import { resolveEnvironmentProfile } from './core/platform/environment.js';
+import { ENVIRONMENT_CHECKS } from './integrations/environmentChecks.js';
+import { bindDeployment } from './core/platform/deployment.js';
 
 /** The zoho-mode auth gate until Zoho sign-in exists: no token is accepted, of any kind. */
 const refuseUntilZohoSignIn = (req, res) => res.status(401).json({
@@ -45,16 +45,27 @@ const ok = (req, body) => ({ requestId: req.id, success: true, ...body });
 /**
  * Build the app.
  *
- * `authMode` is resolved HERE as well as in server.js, deliberately: whatever builds an app —
- * the server, a test, a future Catalyst handler — gets the same refusals, so no entry point can
- * produce an app that serves demo login over live data. An explicit `authMode` (tests) goes
- * through the very same rules; it cannot opt out of them.
+ * The environment profile — sign-in mode, environment, integration requirements, signing secret —
+ * is resolved HERE as well as in server.js, deliberately: whatever builds an app — the server, a
+ * test, a future Catalyst handler — gets the same refusals, so no entry point can produce an app
+ * that serves demo login over live data, or non-demo sign-in under a public secret. An explicit
+ * `authMode` (tests) goes through the very same rules; it cannot opt out of them.
  */
 export function createApp({ authMode } = {}) {
-  const auth = resolveAuthMode(
+  const profile = resolveEnvironmentProfile(
     authMode === undefined ? process.env : { ...process.env, NEUIQ_AUTH_MODE: authMode },
-    { dataSource },
+    { dataSource, integrationChecks: ENVIRONMENT_CHECKS },
   );
+  const auth = profile.auth;
+  // The process now serves exactly this deployment: live caches, the shared employee snapshot and
+  // the store all partition by its namespace, and a second app for ANOTHER namespace is refused.
+  bindDeployment(profile);
+  // Opened here, from the validated profile — a data directory belonging to another deployment, or
+  // created with other Zoho credentials, refuses at startup rather than on the first save.
+  const dashboards = collection('dashboards', {
+    namespace: profile.namespace,
+    bindings: { credentialFingerprint: profile.integrations.credentialFingerprint ?? null },
+  });
   const app = express();
   app.disable('x-powered-by');
   app.use(express.json({ limit: '256kb' }));

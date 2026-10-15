@@ -20,7 +20,7 @@
 import assert from 'node:assert/strict';
 
 import {
-  dataCentre, apiBase, accountsBase, isConfirmed, DATA_CENTRES, DEFAULT_DC,
+  dataCentre, apiBase, accountsBase, isConfirmed, DATA_CENTRES, resolveZohoDc, expectedApiDomain,
 } from '../functions/neuiq_api/src/integrations/zoho/_shared/datacenters.js';
 import {
   scopeFor, requestedScopes, isConfirmedScope, CONFIRMED_SCOPES, PENDING_SCOPES,
@@ -37,7 +37,7 @@ import {
   ZohoAuthError, ZohoForbiddenError, ZohoRateLimitError, ZohoUpstreamError,
 } from '../functions/neuiq_api/src/integrations/zoho/_shared/errors.js';
 import {
-  resolveDataSource, describeDataSource, SEED, ZOHO,
+  resolveDataSource, describeDataSource, SEED, ZOHO, zohoPeopleEnvironmentCheck,
 } from '../functions/neuiq_api/src/integrations/zoho/people/dataSource.js';
 import {
   createTokenProvider, configFromEnv, describeConfig, isConfigured,
@@ -49,7 +49,7 @@ import {
 import {
   endpoint, dataSelectFor, LEAVE_DATA_SELECT, DOCUMENTED_UNTRIED, CONFIRMED_ENDPOINTS,
 } from '../functions/neuiq_api/src/integrations/zoho/people/endpoints.js';
-import { createCache, cacheKey } from '../functions/neuiq_api/src/core/platform/cache.js';
+import { createCache, cacheKey, scopedCacheKey } from '../functions/neuiq_api/src/core/platform/cache.js';
 import {
   createZohoClient, parseZohoJson, SOURCE_TEXT_SUPPORTED,
 } from '../functions/neuiq_api/src/integrations/zoho/_shared/client.js';
@@ -72,7 +72,7 @@ import {
   createPeopleClient, BALANCE_RATE_LIMIT, EMPLOYEE_PAGE_SIZE, DIRECTORY_MAX_PAGES, DIRECTORY_MAX_RECORDS,
   DIRECTORY_PAGE_RATE_LIMIT, PAGINATION,
 } from '../functions/neuiq_api/src/integrations/zoho/people/client.js';
-import { assertResultAllowed } from '../functions/neuiq_api/src/core/tools/registry.js';
+import { assertResultAllowed, mayCall } from '../functions/neuiq_api/src/core/tools/registry.js';
 import {
   transformEmployeeIdentity, exactId, IDENTITY_FIELDS,
 } from '../functions/neuiq_api/src/integrations/zoho/people/transformers/employeeIdentity.js';
@@ -90,6 +90,8 @@ import {
   PEOPLE_TOOLS, PERSON_FIELDS, ON_LEAVE_FIELDS,
 } from '../functions/neuiq_api/src/integrations/zoho/people/tools/index.js';
 import { setDirectory } from '../functions/neuiq_api/src/core/policy/authorize.js';
+import { bindDeployment, currentNamespace, boundDeployment } from '../functions/neuiq_api/src/core/platform/deployment.js';
+import { createEmployeeSnapshot, EmployeeSnapshotError, SNAPSHOT_FAILURE_COOLDOWN_MS, SNAPSHOT_MAX_TTL_MS, assertSnapshotNamespace } from '../functions/neuiq_api/src/integrations/zoho/people/employeeSnapshot.js';
 import { directory as seedDirectory } from '../functions/neuiq_api/src/integrations/zoho/people/directory.js';
 import { runQuery, runQueryAsync } from '../functions/neuiq_api/src/core/query/engine.js';
 import { SOURCES, registerSources } from '../functions/neuiq_api/src/core/query/sources.js';
@@ -106,12 +108,55 @@ const ok = (fn, what) => { fn(); n++; console.log('ok  ', what); };
 const throws = (fn, what) => { assert.throws(fn); n++; console.log('ok  ', what); };
 const rejects = async (fn, what) => { await assert.rejects(fn); n++; console.log('ok  ', what); };
 
+// ---------------------------------------------------------------- deployment binding (E2.2)
+// Live components read the deployment namespace AT REQUEST TIME from core/platform/deployment.js.
+// Before anything binds one (createApp() does, from the validated profile) every live read is
+// refused — proved here, first, because binding is once per process. Then this suite binds the
+// synthetic test namespace every later live check runs in.
+const TEST_NS = 'test/zoho-com/unit-test';
+await (async () => {
+  assert.equal(boundDeployment(), null, 'nothing bound yet');
+  assert.throws(() => currentNamespace(), (e) => e.code === 'DEPLOYMENT_UNBOUND' && e.status === 503);
+  let walked = 0;
+  const client = { employees: async () => { walked++; return []; }, leaves: async () => { walked++; return []; } };
+  const sources = buildLiveSources({ client });
+  const tools = buildLiveTools({ client });
+  const admin = { employeeId: 'E9001', role: 'hr_admin' };
+  await assert.rejects(() => sources.employees.fetchRows({ user: admin }), (e) => e.status === 503);
+  await assert.rejects(() => sources.leave.fetchRows({ user: admin }), (e) => e.code === 'DEPLOYMENT_UNBOUND');
+  await assert.rejects(() => tools['zohoPeople.headcount'].run({ groupBy: 'department' }, admin), (e) => e.status === 503);
+  assert.equal(walked, 0, 'an unbound process never reaches Zoho');
+  n++; console.log('ok   deployment: before a deployment is bound, every live source and tool refuses (503) without a request');
+})();
+ok(() => {
+  bindDeployment({ namespace: TEST_NS, environment: 'test' });
+  assert.equal(currentNamespace(), TEST_NS);
+  bindDeployment({ namespace: TEST_NS, environment: 'test' });          // same namespace: no-op
+  assert.throws(() => bindDeployment({ namespace: 'prod/zoho-com/acme', environment: 'prod' }), /one process serves one deployment/);
+  assert.throws(() => bindDeployment({ namespace: 'dev/seed', environment: 'dev' }), /one process serves one deployment/);
+  assert.equal(currentNamespace(), TEST_NS, 'a refused rebind changes nothing');
+}, 'deployment: one process binds one namespace — rebinding to another (prod, or dev) is refused');
+
 // ---------------------------------------------------------------- data centres
-ok(() => assert.equal(DEFAULT_DC, 'in'), 'dc: India is the default');
+// CHANGED in E2.2A-1 (S2): there is no default data centre any more. This asserted India was it.
+throws(() => dataCentre(), 'dc: no code is refused — there is no default to fall back to');
+throws(() => dataCentre(''), 'dc: a blank code is refused');
+throws(() => apiBase('people'), 'dc: apiBase without a code is refused, never India');
+throws(() => accountsBase(), 'dc: accountsBase without a code is refused, never India');
 ok(() => assert.equal(apiBase('people', 'in'), 'https://people.zoho.in'), 'dc: confirmed India People host');
 ok(() => assert.equal(accountsBase('in'), 'https://accounts.zoho.in'), 'dc: India accounts host');
 ok(() => assert.ok(isConfirmed('in')), 'dc: India is marked confirmed');
-ok(() => assert.equal(isConfirmed('com'), false), 'dc: unreached DCs are not marked confirmed');
+// CHANGED in E2.2A-1 (S9): .com was reached through this code on 2026-10-13/14 (test organisation).
+ok(() => {
+  assert.ok(isConfirmed('com'));
+  assert.equal(DATA_CENTRES.com.accountsStatus, 'confirmed', 'tokens were minted on accounts.zoho.com');
+  assert.equal(DATA_CENTRES.in.accountsStatus, 'unverified', 'no token was ever minted on accounts.zoho.in');
+  assert.equal(apiBase('people', 'com'), 'https://people.zoho.com');
+  assert.equal(accountsBase('com'), 'https://accounts.zoho.com');
+}, 'dc: .com is recorded as verified (People and accounts hosts); .in accounts stays unverified');
+ok(() => {
+  for (const code of ['eu', 'au', 'jp', 'ca', 'sa']) assert.equal(isConfirmed(code), false, code);
+}, 'dc: unreached DCs are not marked confirmed');
 throws(() => dataCentre('xx'), 'dc: unknown code throws rather than defaulting to India');
 throws(() => apiBase('crm', 'in'), 'dc: a product with no observed host refuses to guess one');
 ok(() => assert.equal(dataCentre('IN').code, 'in'), 'dc: code is case-insensitive');
@@ -125,12 +170,13 @@ ok(() => {
 
 // ---------------------------------------------------------------- scopes
 ok(() => assert.equal(scopeFor('people.forms.read'), 'ZOHOPEOPLE.forms.READ'), 'scopes: confirmed forms scope, exact casing');
-throws(() => scopeFor('people.leave.read'), 'scopes: pending leave scope refuses rather than guessing');
+// CHANGED in E2.2A-1 (S9): ZOHOPEOPLE.leave.READ was granted on the .com test token (2026-10-13).
+ok(() => assert.equal(scopeFor('people.leave.read'), 'ZOHOPEOPLE.leave.READ'), 'scopes: leave scope recorded from the granted .com token, exact casing');
 throws(() => scopeFor('people.attendance.read'), 'scopes: pending attendance scope refuses');
 throws(() => scopeFor('people.nonsense'), 'scopes: unknown key throws');
-ok(() => assert.deepEqual(requestedScopes(), ['ZOHOPEOPLE.forms.READ']), 'scopes: only confirmed scopes are ever requested');
+ok(() => assert.deepEqual(requestedScopes(), ['ZOHOPEOPLE.forms.READ', 'ZOHOPEOPLE.leave.READ']), 'scopes: only confirmed scopes are ever requested — forms and leave, never attendance');
 ok(() => assert.ok(isConfirmedScope('people.forms.read')), 'scopes: confirmed key reports true');
-ok(() => assert.equal(isConfirmedScope('people.leave.read'), false), 'scopes: pending key reports false');
+ok(() => assert.equal(isConfirmedScope('people.attendance.read'), false), 'scopes: pending key reports false (attendance)');
 ok(() => {
   // A pending entry with a non-null scope would mean someone filled in a guess.
   for (const [key, def] of Object.entries(PENDING_SCOPES)) assert.equal(def.scope, null, key);
@@ -331,7 +377,12 @@ ok(() => {
 
 // ---------------------------------------------------------------- oauth provider
 ok(() => assert.equal(isConfigured(configFromEnv({})), false), 'oauth: unconfigured reports false rather than throwing');
-ok(() => assert.equal(configFromEnv({}).dc, 'in'), 'oauth: defaults to the India DC');
+// CHANGED in E2.2A-1 (S2): this asserted an unset ZOHO_DC meant India.
+ok(() => {
+  assert.equal(configFromEnv({}).dc, null, 'unset is null, never a default');
+  assert.equal(configFromEnv({ ZOHO_DC: '  ' }).dc, null, 'blank is unset');
+  assert.equal(configFromEnv({ ZOHO_DC: ' COM ' }).dc, 'com', 'trimmed and lower-cased');
+}, 'oauth: ZOHO_DC has no default — unset reads as null, not India');
 ok(() => {
   // Sentinels are deliberately long and unmistakable. A short one like "sh" is a substring of
   // "refreshToken" and would make this assertion fail against correct code.
@@ -360,9 +411,11 @@ const CONFIG = {
   clientSecret: 'CSECRET_SENTINEL',
   refreshToken: 'RTOKEN_SENTINEL',
 };
-const tokenResponse = (token, expiresIn = 3600) => ({
+// CHANGED in E2.2: a token response must name the API domain of the DC it was minted for (the
+// provider refuses anything else). CONFIG below is the `in` DC, so that is the default here.
+const tokenResponse = (token, expiresIn = 3600, apiDomain = 'https://www.zohoapis.in') => ({
   ok: true, status: 200, headers: new Map(),
-  json: async () => ({ access_token: token, expires_in: expiresIn }),
+  json: async () => ({ access_token: token, expires_in: expiresIn, api_domain: apiDomain }),
 });
 
 await rejects(
@@ -431,7 +484,11 @@ await (async () => {
   const seen = [];
   const p = createTokenProvider({
     config: CONFIG,
-    fetchImpl: async (url) => { seen.push(url); return tokenResponse(`tok-${seen.length}`); },
+    // CHANGED in E2.2: each DC's token now carries that DC's api_domain, as Zoho's would.
+    fetchImpl: async (url) => {
+      seen.push(url);
+      return tokenResponse(`tok-${seen.length}`, 3600, url.startsWith('https://accounts.zoho.com') ? 'https://www.zohoapis.com' : 'https://www.zohoapis.in');
+    },
   });
   const a = await p.getAccessToken({ dc: 'in' });
   const b = await p.getAccessToken({ dc: 'com' });
@@ -728,12 +785,15 @@ ok(() => {
 }, 'endpoints: leave and attendance take DIFFERENT employee identifiers');
 
 ok(() => {
-  // The endpoint ledger points at scope keys; those are still pending in scopes.js and must not
-  // have been quietly promoted by this change.
+  // The endpoint ledger points at scope keys. A scope is promoted only on evidence of the GRANT,
+  // never because an endpoint answered (confirming data_select proved nothing about scopes).
+  // CHANGED in E2.2A-1 (S9): leave was promoted on that evidence — the .com test token's granted
+  // scope list carried ZOHOPEOPLE.leave.READ (2026-10-13). Attendance has no such evidence.
   assert.equal(isConfirmedScope(endpoint('people.employee.records').scopeKey), true);
-  assert.equal(isConfirmedScope(endpoint('people.leave.list').scopeKey), false);
+  assert.equal(isConfirmedScope(endpoint('people.leave.list').scopeKey), true);
+  assert.equal(CONFIRMED_SCOPES['people.leave.read'].confirmedOn, '2026-10-13');
   assert.equal(isConfirmedScope(endpoint('people.attendance.entries').scopeKey), false);
-}, 'endpoints: confirming data_select did NOT promote the pending v3 scopes');
+}, 'endpoints: scopes are promoted only on a recorded grant — leave (granted on .com), never attendance');
 
 // ---------------------------------------------------------------- cache
 ok(() => {
@@ -1307,7 +1367,7 @@ await (async () => {
 // ---- team hierarchy is disabled in live mode, and fails CLOSED ----
 ok(() => {
   const m = buildPeopleManifest({
-    NEUIQ_DATA_SOURCE: 'zoho', ZOHO_CLIENT_ID: 'a', ZOHO_CLIENT_SECRET: 'b', ZOHO_REFRESH_TOKEN: 'c',
+    NEUIQ_DATA_SOURCE: 'zoho', ZOHO_DC: 'com', ZOHO_CLIENT_ID: 'a', ZOHO_CLIENT_SECRET: 'b', ZOHO_REFRESH_TOKEN: 'c',
   });
   assert.equal(m.directory.hierarchyAvailable, false);
   // No manager field was observed, so there is nothing to build a reporting line from. Leaving
@@ -1317,7 +1377,7 @@ ok(() => {
 }, 'live: the reporting hierarchy is switched off, not backed by seed relationships');
 ok(() => {
   const m = buildPeopleManifest({
-    NEUIQ_DATA_SOURCE: 'zoho', ZOHO_CLIENT_ID: 'a', ZOHO_CLIENT_SECRET: 'b', ZOHO_REFRESH_TOKEN: 'c',
+    NEUIQ_DATA_SOURCE: 'zoho', ZOHO_DC: 'com', ZOHO_CLIENT_ID: 'a', ZOHO_CLIENT_SECRET: 'b', ZOHO_REFRESH_TOKEN: 'c',
   });
   // The live directory is a spread of the seed one. Without an explicit override the SEED's
   // reportsOf would ride along into live mode and decide real team scope from demo data.
@@ -1346,7 +1406,7 @@ const counting = (rows, empRows = []) => {
 /** Run `fn` with the LIVE directory installed, as it is when NEUIQ_DATA_SOURCE=zoho. */
 const withLiveDirectory = async (fn) => {
   const m = buildPeopleManifest({
-    NEUIQ_DATA_SOURCE: 'zoho', ZOHO_CLIENT_ID: 'a', ZOHO_CLIENT_SECRET: 'b', ZOHO_REFRESH_TOKEN: 'c',
+    NEUIQ_DATA_SOURCE: 'zoho', ZOHO_DC: 'com', ZOHO_CLIENT_ID: 'a', ZOHO_CLIENT_SECRET: 'b', ZOHO_REFRESH_TOKEN: 'c',
   });
   setDirectory(m.directory);
   try { return await fn(); } finally { setDirectory(seedDirectory); }
@@ -1424,9 +1484,49 @@ throws(
   () => buildPeopleManifest({ NEUIQ_DATA_SOURCE: 'zoho' }),
   'manifest: zoho selected without OAuth configured REFUSES AT BOOT, not on first request',
 );
+
+// ---------------------------------------------------------------- required data centre (E2.2A-1, S2)
+const LIVE_CREDS = { ZOHO_CLIENT_ID: 'a', ZOHO_CLIENT_SECRET: 'b', ZOHO_REFRESH_TOKEN: 'c' };
+ok(() => {
+  for (const missing of [{}, { ZOHO_DC: '' }, { ZOHO_DC: '   ' }, { ZOHO_DC: null }]) {
+    assert.throws(() => resolveZohoDc(missing), /ZOHO_DC is required when NEUIQ_DATA_SOURCE=zoho — there is no default/);
+  }
+  for (const bad of ['xx', 'india', 'us', 'com.au', 'zoho.com']) {
+    assert.throws(() => resolveZohoDc({ ZOHO_DC: bad }), /unknown data centre/, bad);
+  }
+  // A credential pasted into ZOHO_DC is clipped, never echoed whole.
+  const pasted = '1000.SECRETVALUE_SHOULD_NOT_APPEAR_1234567890';
+  assert.throws(() => resolveZohoDc({ ZOHO_DC: pasted }), (e) => !e.message.includes(pasted) && !e.message.includes('SHOULD_NOT_APPEAR'));
+  assert.equal(resolveZohoDc({ ZOHO_DC: ' COM ' }).code, 'com');
+  assert.equal(resolveZohoDc({ ZOHO_DC: 'in' }).code, 'in');
+}, 'S2: ZOHO_DC is required for live Zoho — missing, blank and unknown values refuse; nothing defaults to India');
+ok(() => {
+  assert.throws(() => buildPeopleManifest({ NEUIQ_DATA_SOURCE: 'zoho', ...LIVE_CREDS }), /ZOHO_DC is required/);
+  assert.throws(() => buildPeopleManifest({ NEUIQ_DATA_SOURCE: 'zoho', ZOHO_DC: 'xx', ...LIVE_CREDS }), /unknown data centre/);
+  const m = buildPeopleManifest({ NEUIQ_DATA_SOURCE: 'zoho', ZOHO_DC: 'com', ...LIVE_CREDS });
+  assert.equal(m.dataSource, 'zoho');
+  // Seed ignores ZOHO_DC entirely — the local dev .env carries one and must keep working.
+  assert.equal(buildPeopleManifest({ ZOHO_DC: 'xx' }).dataSource, 'seed');
+}, 'S2: a live manifest refuses without a valid ZOHO_DC; a seed manifest ignores it');
+ok(() => {
+  assert.deepEqual(zohoPeopleEnvironmentCheck({ ZOHO_DC: 'xx' }, { dataSource: 'seed' }), {}, 'seed: nothing required');
+  assert.deepEqual(zohoPeopleEnvironmentCheck({ ZOHO_DC: 'com' }, { dataSource: 'zoho' }),
+    { zohoDc: 'com', partition: 'zoho-com', credentialFingerprint: null });
+  assert.throws(() => zohoPeopleEnvironmentCheck({}, { dataSource: 'zoho' }), /ZOHO_DC is required/);
+  // The DC code, the partition and a truncated hash — never a host, a client id or a secret.
+  const clientId = '1000.CLIENTID_SENTINEL_XYZ';
+  const r = zohoPeopleEnvironmentCheck({ ZOHO_DC: 'com', ZOHO_CLIENT_ID: clientId, ZOHO_CLIENT_SECRET: 'SECRET_SENTINEL', ZOHO_REFRESH_TOKEN: 'REFRESH_SENTINEL' }, { dataSource: 'zoho' });
+  assert.deepEqual(Object.keys(r).sort(), ['credentialFingerprint', 'partition', 'zohoDc']);
+  assert.match(r.credentialFingerprint, /^[0-9a-f]{16}$/);
+  for (const leak of ['CLIENTID_SENTINEL', 'SECRET_SENTINEL', 'REFRESH_SENTINEL']) assert.equal(JSON.stringify(r).includes(leak), false, leak);
+  const other = zohoPeopleEnvironmentCheck({ ZOHO_DC: 'com', ZOHO_CLIENT_ID: '1000.OTHER_CLIENT' }, { dataSource: 'zoho' });
+  assert.notEqual(other.credentialFingerprint, r.credentialFingerprint, 'other credentials, other fingerprint');
+  const otherDc = zohoPeopleEnvironmentCheck({ ZOHO_DC: 'in', ZOHO_CLIENT_ID: clientId }, { dataSource: 'zoho' });
+  assert.notEqual(otherDc.credentialFingerprint, r.credentialFingerprint, 'same client id on another DC is another binding');
+}, 'S2: the Zoho startup check returns the DC, its partition and a credential fingerprint — never a credential; live data only');
 ok(() => {
   const m = buildPeopleManifest({
-    NEUIQ_DATA_SOURCE: 'zoho', ZOHO_CLIENT_ID: 'a', ZOHO_CLIENT_SECRET: 'b', ZOHO_REFRESH_TOKEN: 'c',
+    NEUIQ_DATA_SOURCE: 'zoho', ZOHO_DC: 'com', ZOHO_CLIENT_ID: 'a', ZOHO_CLIENT_SECRET: 'b', ZOHO_REFRESH_TOKEN: 'c',
   });
   assert.equal(m.dataSource, 'zoho');
   assert.ok(m.client);
@@ -1971,7 +2071,7 @@ ok(() => {
 await (async () => {
   // Wired from configuration at boot: a live manifest with no leave year refuses, offline.
   const m = buildPeopleManifest({
-    NEUIQ_DATA_SOURCE: 'zoho', ZOHO_CLIENT_ID: 'a', ZOHO_CLIENT_SECRET: 'b', ZOHO_REFRESH_TOKEN: 'c',
+    NEUIQ_DATA_SOURCE: 'zoho', ZOHO_DC: 'com', ZOHO_CLIENT_ID: 'a', ZOHO_CLIENT_SECRET: 'b', ZOHO_REFRESH_TOKEN: 'c',
   });
   assert.equal(await reason(m.tools['zohoPeople.leaveBalance'].run({}, SELF_U)), 'PERIOD_NOT_CONFIGURED');
   n++; console.log('ok   balance manifest: live mode without ZOHO_PEOPLE_LEAVE_YEAR_START refuses rather than assume a year');
@@ -2206,7 +2306,7 @@ await (async () => {
 
 ok(() => {
   const live = buildPeopleManifest({
-    NEUIQ_DATA_SOURCE: 'zoho', ZOHO_CLIENT_ID: 'a', ZOHO_CLIENT_SECRET: 'b', ZOHO_REFRESH_TOKEN: 'c',
+    NEUIQ_DATA_SOURCE: 'zoho', ZOHO_DC: 'com', ZOHO_CLIENT_ID: 'a', ZOHO_CLIENT_SECRET: 'b', ZOHO_REFRESH_TOKEN: 'c',
   });
   const seedFns = Object.values(seedDirectory).filter((v) => typeof v === 'function');
   for (const [k, v] of Object.entries(live.directory)) {
@@ -2563,34 +2663,376 @@ await (async () => {
 // -- the live `employees` query source --
 await (async () => {
   const rig = failPage2();
-  registerSources({ __pgEmployees: buildLiveSources({ client: rig.client }).employees });
-  const admin = { employeeId: 'E9101', role: 'hr_admin' };   // its own cache key
+  // CHANGED in E2.2: the source reads the shared employee snapshot, which adds a 30 s cool-down
+  // after a failed load (no request storm). This used to retry at once; now the retry is refused
+  // WITHOUT a request until the cool-down ends — then it walks again.
+  let t = 1_000_000;
+  const employeeSnapshot = createEmployeeSnapshot({ loadRecords: () => rig.client.employees(), namespace: TEST_NS, now: () => t });
+  registerSources({ __pgEmployees: buildLiveSources({ client: rig.client, employeeSnapshot }).employees });
+  const admin = { employeeId: 'E9101', role: 'hr_admin' };
   const spec = { source: '__pgEmployees', metric: 'count' };
 
   await assert.rejects(() => runQueryAsync(spec, admin), (e) => e.status === 503);
   rig.heal();
   const after = rig.calls.length;
-  assert.equal((await runQueryAsync(spec, admin)).data[0].value, 450, 'the failure was not cached: the next query walks again');
+  await assert.rejects(() => runQueryAsync(spec, admin), (e) => e.status === 503 && e.code === 'DIRECTORY_COOLDOWN');
+  assert.equal(rig.calls.length, after, 'during the cool-down: refused without a request');
+  t += SNAPSHOT_FAILURE_COOLDOWN_MS;
+  assert.equal((await runQueryAsync(spec, admin)).data[0].value, 450, 'the failure was not cached: after the cool-down it walks again');
   assert.equal(rig.calls.length, after + 3);
   await runQueryAsync(spec, admin);
-  assert.equal(rig.calls.length, after + 3, 'a complete directory IS cached for its TTL: no second walk');
+  await runQueryAsync(spec, { employeeId: 'E9102', role: 'hr_admin' });
+  assert.equal(rig.calls.length, after + 3, 'a complete directory IS shared for its TTL: no second walk, for any admin');
 
   const before = rig.calls.length;
   await assert.rejects(() => runQueryAsync(spec, { employeeId: 'E1002', role: 'employee' }), (e) => e.status === 403);
   assert.equal(rig.calls.length, before, 'a non-admin is refused before any page is fetched');
-  n++; console.log('ok   consumer employees source: failures are not cached, complete loads are, and non-admins are refused before fetching');
+  n++; console.log('ok   consumer employees source: failures are not cached (and cool down), complete loads are shared, non-admins are refused before fetching');
 })();
 
 // -- all consumers share one page budget --
 await (async () => {
+  // CHANGED in E2.2: headcount and employeeLookup now share ONE snapshot, so the second tool no
+  // longer walks at all (this asserted that its walk ran out of budget). The limiter is still the
+  // backstop when a walk IS needed — forced here by invalidating the snapshot.
   const limiter = createRateLimiter({ name: 'test shared pages', limit: 5, windowMs: 60_000, lockoutMs: 120_000 });
   const rig = pagingRig({ total: 450, limiter });
-  const tools = buildLiveTools({ client: rig.client });
+  const employeeSnapshot = createEmployeeSnapshot({ loadRecords: () => rig.client.employees(), namespace: TEST_NS });
+  const tools = buildLiveTools({ client: rig.client, employeeSnapshot });
   assert.equal((await tools['zohoPeople.headcount'].run({ groupBy: 'department' }, ADMIN)).total, 450);   // 3 pages
+  assert.equal((await tools['zohoPeople.employeeLookup'].run({ name: 'e00000001' }, ADMIN)).count, 1);
+  assert.equal(rig.calls.length, 3, 'the second tool reads the shared snapshot — no second walk');
+  employeeSnapshot.invalidate();
   const err = await tools['zohoPeople.employeeLookup'].run({ name: 'e00000001' }, ADMIN).then(() => null, (e) => e);
-  assert.equal(err?.code, 'LOCAL_RATE_LIMIT', 'the second walk runs out of budget and fails closed');
+  assert.equal(err?.code, 'LOCAL_RATE_LIMIT', 'a forced re-walk runs out of budget and fails closed');
+  assert.equal(err?.status, 429);
   assert.equal(rig.calls.length, 5, 'and the refused page never reached the network');
-  n++; console.log('ok   consumers: every walk draws on one shared page limiter — excess walks fail closed instead of flooding Zoho');
+  n++; console.log('ok   consumers: one shared snapshot (no second walk); a forced re-walk still draws on the shared limiter and fails closed');
+})();
+
+
+// ================================================================ E2.2 — environment security, isolation, shared snapshot
+
+// ---------------------------------------------------------------- OAuth api_domain (Part 2)
+ok(() => {
+  for (const [code, dc] of Object.entries(DATA_CENTRES)) {
+    assert.match(expectedApiDomain(code), /^https:\/\/www\.zohoapis\.[a-z.]+$/, code);
+    assert.equal(dc.apiDomainStatus === 'confirmed', code === 'com', `${code}: only .com was observed`);
+  }
+  assert.equal(expectedApiDomain('com'), 'https://www.zohoapis.com');
+  assert.throws(() => expectedApiDomain(), /no data centre given/);
+}, 'Part 2: every DC has one allow-listed token api_domain; only .com (observed) is marked confirmed');
+
+await (async () => {
+  const domainRes = (apiDomain) => ({ ok: true, status: 200, headers: new Map(), json: async () => ({ access_token: 'TOKEN_SENTINEL_VALUE', expires_in: 3600, ...(apiDomain === undefined ? {} : { api_domain: apiDomain }) }) });
+  for (const [apiDomain, code] of [
+    ['https://www.zohoapis.com', 'API_DOMAIN_MISMATCH'],   // a .com token offered to an `in` config
+    ['https://www.zohoapis.eu', 'API_DOMAIN_MISMATCH'],
+    ['https://evil.example.test', 'API_DOMAIN_MISMATCH'],
+    ['https://www.zohoapis.in.evil.test', 'API_DOMAIN_MISMATCH'],
+    ['', 'API_DOMAIN_MISSING'],
+    [undefined, 'API_DOMAIN_MISSING'],
+  ]) {
+    let calls = 0;
+    const lines = [];
+    const p = createTokenProvider({
+      config: CONFIG,
+      fetchImpl: async () => { calls++; return domainRes(apiDomain); },
+      logger: { info: (o) => lines.push(JSON.stringify(o)) },
+    });
+    const err = await p.getAccessToken().then(() => null, (e) => e);
+    assert.equal(err?.code, code, String(apiDomain));
+    assert.equal(err?.status, 503);
+    assert.equal(p.hasCachedToken(), false, 'a refused token is never cached');
+    await p.getAccessToken().catch(() => {});
+    assert.equal(calls, 2, 'and the next call asks again rather than reusing it');
+    const surface = `${err.message}\n${lines.join('\n')}`;
+    assert.equal(surface.includes('TOKEN_SENTINEL_VALUE'), false, 'the token never reaches a message or a log');
+    if (apiDomain) assert.equal(surface.includes(apiDomain), false, 'the untrusted domain is not echoed');
+  }
+  // The matching domain is accepted.
+  const good = createTokenProvider({ config: { ...CONFIG, dc: 'com' }, fetchImpl: async () => domainRes('https://www.zohoapis.com') });
+  assert.equal(await good.getAccessToken(), 'TOKEN_SENTINEL_VALUE');
+  n++; console.log('ok   Part 2: a token for another DC, an unknown domain or no domain is refused (503), never cached, never logged');
+})();
+
+// ---------------------------------------------------------------- namespaced cache keys (Part 5)
+ok(() => {
+  assert.throws(() => scopedCacheKey('', 'E1', 'leave'), /deployment namespace/);
+  assert.throws(() => scopedCacheKey(undefined, 'E1', 'leave'), /deployment namespace/);
+  assert.throws(() => scopedCacheKey('test/zoho-com/a', '', 'leave'), /must include the caller/);
+  const t = scopedCacheKey('test/zoho-com/acme-test', 'E1', 'leave', '2026-01');
+  const p = scopedCacheKey('prod/zoho-com/acme-prod', 'E1', 'leave', '2026-01');
+  assert.notEqual(t, p, 'the same caller and question in two deployments are two entries');
+  assert.notEqual(scopedCacheKey('test/zoho-com/a', 'E1', 'leave'), scopedCacheKey('test/zoho-com/a', 'E2', 'leave'));
+}, 'Part 5: every live cache key carries the deployment namespace and the caller — neither may be missing');
+
+await (async () => {
+  let reads = 0;
+  const client = { leaves: async () => { reads++; return []; }, employees: async () => [] };
+  const sources = buildLiveSources({ client });
+  for (const user of [undefined, {}, { role: 'hr_admin' }, { employeeId: '' }]) {
+    await assert.rejects(() => sources.leave.fetchRows({ user }), (e) => e.status === 401);
+    await assert.rejects(() => sources.employees.fetchRows({ user }), (e) => e.status === 401);
+  }
+  assert.equal(reads, 0, 'refused before any request');
+  n++; console.log("ok   Part 5: no 'anonymous' shared cache key — a live read with no caller id is a 401 before any request");
+})();
+
+// ---------------------------------------------------------------- the shared snapshot service (Part 4)
+const snapRows = (count) => Array.from({ length: count }, (_, i) => ({ __recordId: PG_ID(i + 1), ZUID: PG_ZUID(i + 1), Employeestatus: 'Active' }));
+
+await (async () => {
+  let loads = 0;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const s = createEmployeeSnapshot({ loadRecords: async () => { loads++; await gate; return snapRows(5); }, namespace: TEST_NS });
+  const waiting = Promise.all(Array.from({ length: 50 }, () => s.get()));
+  release();
+  const all = await waiting;
+  assert.equal(loads, 1, '50 simultaneous callers, one load');
+  assert.ok(all.every((x) => x === all[0]), 'and every one received the same snapshot object');
+  assert.equal(all[0].namespace, TEST_NS);
+  assert.equal(all[0].size, 5);
+  n++; console.log('ok   Part 4 snapshot: single-flight — 50 concurrent callers share one load and one snapshot');
+})();
+
+await (async () => {
+  let t = 1_000_000;
+  let loads = 0;
+  const s = createEmployeeSnapshot({ loadRecords: async () => { loads++; return snapRows(3); }, namespace: TEST_NS, now: () => t, ttlMs: 10 * 60 * 1000 });
+  assert.equal(s.status().ttlMs, SNAPSHOT_MAX_TTL_MS, 'a longer TTL is clamped to five minutes');
+  const a = await s.get();
+  t += SNAPSHOT_MAX_TTL_MS - 1;
+  assert.equal(await s.get(), a, 'a fresh snapshot is served without a load');
+  t += 1;
+  const b = await s.get();
+  assert.notEqual(b, a);
+  assert.equal(loads, 2, 'expired at exactly five minutes');
+  s.invalidate();
+  assert.equal(s.status().loaded, false);
+  await s.get();
+  assert.equal(loads, 3, 'invalidate() forces the next read to load');
+  n++; console.log('ok   Part 4 snapshot: TTL at most five minutes, served from memory while fresh, reloaded after expiry or invalidate()');
+})();
+
+await (async () => {
+  let loads = 0;
+  let release;
+  const s = createEmployeeSnapshot({
+    loadRecords: async () => { const mine = ++loads; if (mine === 1) await new Promise((r) => { release = r; }); return snapRows(mine); },
+    namespace: TEST_NS,
+  });
+  const before = s.get();                        // load 1 in flight
+  await new Promise((r) => setImmediate(r));
+  s.invalidate();                                // e.g. a known organisation change
+  const after = s.get();                         // must NOT join the pre-invalidation load
+  release();
+  const [x, y] = await Promise.all([before, after]);
+  assert.equal(loads, 2, 'a caller after invalidate() starts its own load');
+  assert.equal(y.size, 2, 'and gets the post-invalidation data');
+  assert.equal(x.size, 1, 'the earlier caller still gets the load it was waiting for');
+  assert.equal((await s.get()).size, 2, 'the pre-invalidation load was never stored');
+  n++; console.log('ok   Part 4 snapshot: invalidate() during a load — later callers never join it, and it is never stored');
+})();
+
+await (async () => {
+  let t = 1_000_000;
+  let mode = 'ok';
+  let loads = 0;
+  const lines = [];
+  const s = createEmployeeSnapshot({
+    loadRecords: async () => {
+      loads++;
+      if (mode === 'zoho403') throw Object.assign(new Error(`Zoho said: ${PG_ID(1)} x@example.test`), { status: 403, code: 'NOT_ALLOWED' });
+      if (mode === 'zoho429') throw Object.assign(new Error('rate'), { status: 429, code: 'RATE_LIMITED' });
+      if (mode === 'zoho500') throw Object.assign(new Error('Zoho People is unavailable right now.'), { status: 503 });
+      if (mode === 'odd') throw new Error(`internal detail ${PG_ZUID(1)}`);
+      return snapRows(2);
+    },
+    namespace: TEST_NS, now: () => t,
+    logger: { info: (o) => lines.push(JSON.stringify(o)), warn: (o) => lines.push(JSON.stringify(o)) },
+  });
+  await s.get();
+  for (const [m, status, code] of [['zoho403', 403, 'NOT_ALLOWED'], ['zoho429', 429, 'RATE_LIMITED'], ['zoho500', 503, 'HTTP_503'], ['odd', 503, 'LOAD_FAILED']]) {
+    mode = m;
+    t += SNAPSHOT_MAX_TTL_MS + SNAPSHOT_FAILURE_COOLDOWN_MS + 1;
+    const err = await s.get().then(() => null, (e) => e);
+    assert.ok(err instanceof EmployeeSnapshotError, m);
+    assert.equal(err.status, status, `${m}: a 403 stays a 403, a 429 stays a 429, anything else is a 503`);
+    assert.equal(err.code, code, m);
+    assert.equal(s.status().loaded, false, `${m}: the expired snapshot was dropped, not served`);
+    for (const leak of [PG_ID(1), PG_ZUID(1), 'example.test', 'Zoho said', 'internal detail']) assert.equal(err.message.includes(leak), false, `${m}: ${leak}`);
+  }
+  // Cool-down: refused WITHOUT a request; a 403 stays a 403 during it.
+  mode = 'zoho403';
+  t += SNAPSHOT_FAILURE_COOLDOWN_MS + 1;
+  await s.get().catch(() => {});
+  const n0 = loads;
+  for (let i = 0; i < 25; i++) {
+    t += 100;
+    const e = await s.get().then(() => null, (x) => x);
+    assert.equal(e.status, 403);
+  }
+  assert.equal(loads, n0, '25 calls during the cool-down: zero requests (no request storm)');
+  mode = 'ok';
+  t += SNAPSHOT_FAILURE_COOLDOWN_MS;
+  assert.equal((await s.get()).size, 2, 'after the cool-down a recovered Zoho is used again');
+  const logged = lines.join('\n');
+  for (const leak of [PG_ID(1), PG_ZUID(1), 'example.test', 'Zoho said', 'internal detail']) assert.equal(logged.includes(leak), false, leak);
+  assert.ok(logged.includes('employee_snapshot.load_failed') && logged.includes('"records":2'));
+  n++; console.log('ok   Part 4 snapshot: failures keep only status and code (403/429 preserved), drop the old snapshot, cool down without requests, recover');
+})();
+
+await (async () => {
+  for (const [rows, code] of [[{ not: 'an array' }, 'MALFORMED'], [null, 'MALFORMED'], [snapRows(11), 'TOO_LARGE']]) {
+    const s = createEmployeeSnapshot({ loadRecords: async () => rows, namespace: TEST_NS, maxRecords: 10 });
+    const e = await s.get().then(() => null, (x) => x);
+    assert.equal(e?.code, code);
+    assert.equal(s.status().loaded, false, 'nothing stored');
+  }
+  const s = createEmployeeSnapshot({ loadRecords: async () => snapRows(3), namespace: TEST_NS });
+  const snap = await s.get();
+  assert.ok(Object.isFrozen(snap) && Object.isFrozen(snap.rows) && snap.rows.every(Object.isFrozen));
+  assert.throws(() => { snap.rows[0].Employeestatus = 'Inactive'; }, TypeError, 'no consumer can mutate the shared rows');
+  assert.throws(() => { snap.rows.push({}); }, TypeError);
+  assert.equal(snap.rows[0].__recordId, PG_ID(1), 'exact 18-digit id, as a string');
+  n++; console.log('ok   Part 4 snapshot: malformed and oversized loads are never stored; a stored snapshot is deeply frozen with exact ids');
+})();
+
+await (async () => {
+  let ns = TEST_NS;
+  let loads = 0;
+  const s = createEmployeeSnapshot({ loadRecords: async () => { loads++; return snapRows(2); }, namespace: () => ns });
+  const a = await s.get();
+  assert.equal(a.namespace, TEST_NS);
+  ns = 'prod/zoho-com/acme-prod';
+  const b = await s.get();
+  assert.equal(loads, 2, 'a snapshot from another namespace is dropped, never served');
+  assert.equal(b.namespace, 'prod/zoho-com/acme-prod');
+  assert.throws(() => assertSnapshotNamespace(a, 'prod/zoho-com/acme-prod'), (e) => e.code === 'NAMESPACE_MISMATCH');
+  assert.equal(assertSnapshotNamespace(b, () => 'prod/zoho-com/acme-prod'), b);
+  ns = () => { throw Object.assign(new Error('unbound'), { code: 'DEPLOYMENT_UNBOUND' }); };
+  const unbound = createEmployeeSnapshot({ loadRecords: async () => { loads++; return []; }, namespace: () => ns() });
+  const before = loads;
+  await assert.rejects(() => unbound.get(), (e) => e.code === 'DEPLOYMENT_UNBOUND' && e.status === 503);
+  assert.equal(loads, before, 'an unbound deployment never loads');
+  assert.throws(() => createEmployeeSnapshot({ loadRecords: async () => [] }), /namespace/);
+  assert.throws(() => createEmployeeSnapshot({ loadRecords: async () => [], namespace: '' }), /namespace/);
+  n++; console.log('ok   Part 4 snapshot: namespace-bound — another namespace\'s snapshot is never served; no namespace, no snapshot');
+})();
+
+// ---------------------------------------------------------------- one snapshot, every consumer (Part 4 integration)
+await (async () => {
+  const rig = pagingRig({ total: 450 });
+  const employeeSnapshot = createEmployeeSnapshot({ loadRecords: () => rig.client.employees(), namespace: TEST_NS });
+  const sources = buildLiveSources({ client: rig.client, employeeSnapshot });
+  const tools = buildLiveTools({ client: rig.client, employeeSnapshot });
+  const directory = createEmployeeDirectory({ snapshot: employeeSnapshot, namespace: TEST_NS });
+  registerSources({ __e22Employees: sources.employees });
+
+  const results = await Promise.all([
+    directory.resolveZuid(PG_ZUID(300)),
+    tools['zohoPeople.headcount'].run({ groupBy: 'department' }, ADMIN),
+    tools['zohoPeople.employeeLookup'].run({ name: 'e00000430' }, ADMIN),
+    runQueryAsync({ source: '__e22Employees', metric: 'count' }, ADMIN),
+    directory.reportsOf(PG_ID(1)),
+  ]);
+  assert.equal(results[0].ok, true);
+  assert.equal(results[1].total, 450);
+  assert.equal(results[2].count, 1);
+  assert.equal(results[3].data[0].value, 450);
+  assert.equal(employeeSnapshot.status().loads, 1, 'five concurrent consumers, one load');
+  assert.deepEqual(pgStarts(rig), [1, 201, 401], 'one walk of three pages — not one per consumer');
+  for (let i = 0; i < 20; i++) {
+    await directory.resolveZuid(PG_ZUID(i + 1));
+    await tools['zohoPeople.headcount'].run({ groupBy: 'department' }, ADMIN);
+    await tools['zohoPeople.employeeLookup'].run({ name: `e000000${String(i + 10).padStart(2, '0')}` }, ADMIN);
+  }
+  assert.equal(rig.calls.length, 3, '60 more consumer calls while fresh: zero requests');
+  n++; console.log('ok   Part 4: the directory, employees source, headcount and lookup share ONE load (3 pages for 450) — cache hits make no request');
+})();
+
+await (async () => {
+  const rig = pagingRig({ total: 450, override: (s) => (s === 201 ? [503, '{}'] : null) });
+  const employeeSnapshot = createEmployeeSnapshot({ loadRecords: () => rig.client.employees(), namespace: TEST_NS });
+  const tools = buildLiveTools({ client: rig.client, employeeSnapshot });
+  const directory = createEmployeeDirectory({ snapshot: employeeSnapshot, namespace: TEST_NS });
+  const [dir, head, look] = await Promise.all([
+    directory.resolveZuid(PG_ZUID(1)),
+    tools['zohoPeople.headcount'].run({ groupBy: 'department' }, ADMIN).then(() => null, (e) => e),
+    tools['zohoPeople.employeeLookup'].run({ name: 'e00000001' }, ADMIN).then(() => null, (e) => e),
+  ]);
+  assert.deepEqual(dir, { ok: false, reason: LOOKUP.UNAVAILABLE }, 'the directory: unavailable, not page 1');
+  assert.equal(head?.status, 503, 'headcount: an error, not a total of 200');
+  assert.equal(look?.status, 503, 'lookup: an error, even though the match was on page 1');
+  assert.deepEqual(pgStarts(rig), [1, 201], 'one failed walk, shared — not three');
+  n++; console.log('ok   Part 4: a failed shared load fails every consumer at once — no partial directory anywhere, one walk');
+})();
+
+// ---------------------------------------------------------------- access control with a WARM shared cache (Part 4 / Part 7)
+await (async () => {
+  const rig = pagingRig({ total: 300 });
+  const employeeSnapshot = createEmployeeSnapshot({ loadRecords: () => rig.client.employees(), namespace: TEST_NS });
+  const sources = buildLiveSources({ client: rig.client, employeeSnapshot });
+  const tools = buildLiveTools({ client: rig.client, employeeSnapshot });
+  registerSources({ __e22Warm: sources.employees });
+  // An HR admin warms the organisation-wide snapshot.
+  assert.equal((await runQueryAsync({ source: '__e22Warm', metric: 'count' }, ADMIN)).data[0].value, 300);
+  const warmCalls = rig.calls.length;
+
+  // ...and that grants nobody else anything.
+  for (const caller of [EMPLOYEE, MANAGER_LIVE, { employeeId: '555000000200000001', role: 'employee' }]) {
+    await assert.rejects(() => runQueryAsync({ source: '__e22Warm', metric: 'count' }, caller), (e) => e.status === 403, caller.role);
+  }
+  assert.equal(mayCall('zohoPeople.headcount', EMPLOYEE), false, 'headcount stays admin-only');
+  assert.equal(mayCall('zohoPeople.headcount', MANAGER_LIVE), false);
+  assert.equal(mayCall('zohoPeople.employeeLookup', EMPLOYEE), false, 'lookup stays team-scoped: employees cannot call it');
+  await withLiveDirectory(async () => {
+    // Live mode: no reporting line is trusted (E3 not built) — a manager is refused, warm cache or not.
+    await assert.rejects(() => tools['zohoPeople.employeeLookup'].run({ name: 'e' }, MANAGER_LIVE), (e) => e.status === 403);
+  });
+  assert.equal(rig.calls.length, warmCalls, 'the refusals made no request either');
+
+  // A guessed record id is no shortcut: the lookup matches on reach first, then on the query.
+  const admin = await tools['zohoPeople.employeeLookup'].run({ name: PG_ID(150).slice(-8) }, ADMIN);
+  for (const e of admin.employees) assert.deepEqual(Object.keys(e), PERSON_FIELDS, 'allow-listed fields only, never the raw row');
+  n++; console.log('ok   Part 4/7: a snapshot warmed by an HR admin grants no employee or manager anything — 403s, no request, allow-listed output');
+})();
+
+await (async () => {
+  // Per-caller answers are never shared: the balance cache key carries namespace AND caller.
+  const keys = new Set();
+  const balanceCache = { wrap: async (key, _ttl, loader) => { keys.add(key); return loader(); } };
+  const rig = balanceRig();
+  const tools = buildLiveTools({ client: rig.client, now: () => OCT13, leaveYearStart: '01-01', balanceCache });
+  await withDigitDirectory(async () => {
+    await tools['zohoPeople.leaveBalance'].run({}, SELF_U).catch(() => {});
+    await tools['zohoPeople.leaveBalance'].run({ employeeId: EMP }, ADMIN_U).catch(() => {});
+  });
+  const list = [...keys];
+  assert.equal(list.length, 2, 'two callers asking about the same employee: two cache entries');
+  assert.ok(list.every((k) => k.startsWith(`${TEST_NS}#`)), 'each key starts with the deployment namespace');
+  assert.notEqual(list[0], list[1]);
+  n++; console.log('ok   Part 7: per-caller results are cached per namespace AND per caller — never returned to another user');
+})();
+
+// ---------------------------------------------------------------- 401 during paging (Part 7)
+await (async () => {
+  let page2 = 0;
+  const rig = pagingRig({ total: 450, override: (s) => (s === 201 && page2++ === 0 ? new Response('{"code":"INVALID_TOKEN"}', { status: 401 }) : null) });
+  const rows = await rig.client.employees();
+  assert.equal(rows.length, 450, 'one 401 buys exactly one token refresh and one retry of that page');
+  assert.deepEqual(pgStarts(rig), [1, 201, 201, 401]);
+
+  const always = pagingRig({ total: 450, override: (s) => (s === 201 ? new Response('{}', { status: 401 }) : null) });
+  const err = await always.client.employees().then(() => null, (e) => e);
+  assert.equal(err?.status, 401, 'a second 401 is surfaced, not retried forever');
+  assert.deepEqual(pgStarts(always), [1, 201, 201]);
+  const snap = createEmployeeSnapshot({ loadRecords: () => always.client.employees(), namespace: TEST_NS });
+  const e2 = await snap.get().then(() => null, (e) => e);
+  assert.equal(e2.status, 503, 'to a consumer, a credential failure is "unavailable" — never a partial directory');
+  n++; console.log('ok   Part 7: a 401 mid-walk refreshes the token once and retries that page once; a persistent 401 fails the whole load');
 })();
 
 console.log(`\nall ${n} zoho integration checks pass`);

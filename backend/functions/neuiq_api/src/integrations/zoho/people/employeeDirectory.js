@@ -30,19 +30,28 @@
  *                       refused WITHOUT a request, so an outage is not hammered
  *   invalidate()        drops the snapshot now; an in-flight refresh started before it is not kept
  *
+ * E2.2: the snapshot itself now lives in employeeSnapshot.js — the SAME rules, moved there so the
+ * live `employees` source, `headcount` and `employeeLookup` share one load with this directory
+ * instead of each walking Zoho. This file indexes whichever snapshot it is given, rebuilding the
+ * index only when the snapshot object changes.
+ *
  * ## What is logged
  *
  * Event names, record counts, problem-code counts, error codes. Never an id, a ZUID, a name, an
  * email or a response body.
  */
 import { transformEmployeeIdentity, exactId } from './transformers/employeeIdentity.js';
+import {
+  createEmployeeSnapshot, assertSnapshotNamespace,
+  SNAPSHOT_MAX_TTL_MS, SNAPSHOT_FAILURE_COOLDOWN_MS, SNAPSHOT_MAX_RECORDS,
+} from './employeeSnapshot.js';
 
 /** The longest a snapshot may be used. A configured TTL above this is clamped down. */
-export const DIRECTORY_MAX_TTL_MS = 5 * 60 * 1000;
+export const DIRECTORY_MAX_TTL_MS = SNAPSHOT_MAX_TTL_MS;
 /** After a failed refresh, refuse without a request for this long. */
-export const DIRECTORY_FAILURE_COOLDOWN_MS = 30 * 1000;
+export const DIRECTORY_FAILURE_COOLDOWN_MS = SNAPSHOT_FAILURE_COOLDOWN_MS;
 /** A response larger than this is treated as malformed rather than indexed. */
-export const MAX_DIRECTORY_RECORDS = 10_000;
+export const MAX_DIRECTORY_RECORDS = SNAPSHOT_MAX_RECORDS;
 
 /** Why a lookup did not produce an employee. Codes, safe to log and to return. */
 export const LOOKUP = Object.freeze({
@@ -142,60 +151,58 @@ export function buildEmployeeIndex(rows) {
 }
 
 /**
- * The directory over a loader.
+ * The directory over a shared snapshot (E2.2), or over its own private one.
  *
- * @param loadRecords  () => Promise<rawRows>  — in live mode, the service-account client's
- *                     `employees()`; injected so every behaviour is testable with no network.
+ * @param snapshot     the deployment's shared employee snapshot (employeeSnapshot.js) — what the
+ *                     live manifest passes, so the directory and every other consumer share ONE load
+ * @param namespace    when given with `snapshot`, a snapshot from any other namespace is refused
+ * @param loadRecords  () => Promise<rawRows> — the older form: a PRIVATE snapshot is created over it
+ *                     with the same rules. Used by tests and anything not wired to a shared snapshot.
  */
 export function createEmployeeDirectory({
   loadRecords,
+  snapshot = null,
+  namespace = null,
   now = () => Date.now(),
   ttlMs = DIRECTORY_MAX_TTL_MS,
   failureCooldownMs = DIRECTORY_FAILURE_COOLDOWN_MS,
   logger = null,
 }) {
-  if (typeof loadRecords !== 'function') throw new Error('employee directory: loadRecords is required');
-  const ttl = Math.min(Math.max(Number(ttlMs) || 0, 1), DIRECTORY_MAX_TTL_MS);
+  if (snapshot && loadRecords) throw new Error('employee directory: give a shared snapshot OR loadRecords, not both');
+  if (!snapshot && typeof loadRecords !== 'function') throw new Error('employee directory: loadRecords is required');
+  // A private snapshot is owned by this directory alone; its namespace only labels it.
+  const source = snapshot ?? createEmployeeSnapshot({
+    loadRecords, namespace: namespace ?? 'private:employee-directory', now, ttlMs, failureCooldownMs,
+    maxRecords: MAX_DIRECTORY_RECORDS,
+  });
+  const expected = snapshot ? namespace : null;
 
-  let snapshot = null;          // { index, loadedAt }
-  let inFlight = null;          // the shared refresh promise
-  let failedAt = null;          // when the last refresh failed
-  let generation = 0;           // bumped by invalidate(): a refresh begun earlier is not kept
+  let memo = null;              // { snap, index } — the index built from exactly this snapshot
 
   const log = (level, event, detail = {}) => { logger?.[level]?.({ event, ...detail }); };
 
   async function current() {
-    const t = now();
-    if (snapshot && t - snapshot.loadedAt < ttl) return snapshot.index;
-    snapshot = null;              // expired: dropped BEFORE refreshing, so it can never be served
-    if (failedAt !== null && t - failedAt < failureCooldownMs) throw new DirectoryError('COOLDOWN');
-
-    if (!inFlight) {
-      const gen = generation;
-      inFlight = (async () => {
-        try {
-          const index = buildEmployeeIndex(await loadRecords());
-          if (gen === generation) { snapshot = { index, loadedAt: now() }; failedAt = null; }
-          log('info', 'directory.refreshed', { counts: index.counts, issues: index.issues });
-          return index;
-        } catch (err) {
-          failedAt = now();
-          // A code, never the error's text: a Zoho error body can echo request details.
-          const code = err?.code && /^[A-Z_]{2,40}$/.test(String(err.code)) ? err.code : (err?.status ? `HTTP_${err.status}` : 'LOAD_FAILED');
-          log('warn', 'directory.refresh_failed', { code });
-          throw new DirectoryError('UNAVAILABLE');
-        } finally {
-          inFlight = null;
-        }
-      })();
+    const snap = assertSnapshotNamespace(await source.get(), expected);
+    if (memo?.snap !== snap) {
+      const index = buildEmployeeIndex(snap.rows);
+      memo = { snap, index };
+      log('info', 'directory.refreshed', { counts: index.counts, issues: index.issues });
     }
-    return inFlight;
+    return memo.index;
   }
 
   /** Run `fn(index)`, turning any load failure into UNAVAILABLE — never a stale answer. */
   async function withIndex(fn) {
     let index;
-    try { index = await current(); } catch { return { ok: false, reason: LOOKUP.UNAVAILABLE }; }
+    try {
+      index = await current();
+    } catch (err) {
+      memo = null;              // nothing from before the failure is kept, even in memory
+      // A code, never the error's text: a Zoho error body can echo request details.
+      const code = err?.code && /^[A-Z][A-Z0-9_]{1,47}$/.test(String(err.code)) ? err.code : 'LOAD_FAILED';
+      if (code !== 'DIRECTORY_COOLDOWN') log('warn', 'directory.refresh_failed', { code });
+      return { ok: false, reason: LOOKUP.UNAVAILABLE };
+    }
     return fn(index);
   }
 
@@ -233,22 +240,23 @@ export function createEmployeeDirectory({
       return withIndex((index) => ({ ok: true, reports: index.reports.get(id) || [] }));
     },
 
-    /** Drop the snapshot now (e.g. after a known org change). */
+    /** Drop the snapshot now (e.g. after a known org change) — for every consumer of a shared one. */
     invalidate() {
-      generation += 1;
-      snapshot = null;
+      source.invalidate();
+      memo = null;
     },
 
     /** Aggregate state for diagnostics. Counts only — no ids, no names. */
     status() {
-      const t = now();
+      const s = source.status();
+      const indexed = s.loaded && memo ? memo.index : null;
       return {
-        loaded: Boolean(snapshot),
-        ageMs: snapshot ? t - snapshot.loadedAt : null,
-        ttlMs: ttl,
-        coolingDown: failedAt !== null && t - failedAt < failureCooldownMs,
-        counts: snapshot?.index.counts ?? null,
-        issues: snapshot?.index.issues ?? null,
+        loaded: s.loaded,
+        ageMs: s.ageMs,
+        ttlMs: s.ttlMs,
+        coolingDown: s.coolingDown,
+        counts: indexed?.counts ?? null,
+        issues: indexed?.issues ?? null,
       };
     },
   };

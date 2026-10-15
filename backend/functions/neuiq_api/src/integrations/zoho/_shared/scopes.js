@@ -25,25 +25,32 @@ export const CONFIRMED_SCOPES = {
     product: 'people',
     confirmedOn: '2026-09-07',
     endpoint: 'GET /people/api/forms/employee/getRecords',
-    note: 'Employee form records. 200 OK on the India DC.',
+    note: 'Employee form records. 200 OK on the India DC (2026-09-07, curl), and granted and used '
+      + 'on the .com test organisation through this code (2026-10-13/14).',
+  },
+  /**
+   * Recorded 2026-10-13 against the .com test organisation, through this code: the token
+   * response's granted `scope` listed exactly ZOHOPEOPLE.forms.READ and ZOHOPEOPLE.leave.READ, and
+   * the leave list and Booked-and-Balance report answered 200 with that token. Observed on the
+   * test organisation only — re-confirm on the production organisation's own credentials.
+   */
+  'people.leave.read': {
+    scope: 'ZOHOPEOPLE.leave.READ',
+    product: 'people',
+    confirmedOn: '2026-10-13',
+    endpoint: 'GET /people/api/v3/leave-tracker/leaves',
+    note: 'Granted on the .com test organisation token; leave list and Booked and Balance report 200.',
   },
 };
 
 /**
  * Endpoints that returned 200 but whose authorising scope was not captured.
  *
- * These are NOT unreached endpoints — leave and attendance both answered 200 on 2026-09-07. What
- * is unknown is whether `ZOHOPEOPLE.forms.READ` already covered them, or whether the token
- * carried a broader grant that happened to include them. Until that is separated, requesting a
- * name for them would be a guess with a consent screen attached.
+ * Attendance answered 200 on 2026-09-07 (India, curl), but which scope authorised it was never
+ * recorded, and the .com test token was not granted any attendance scope. Until that is
+ * separated, requesting a name for it would be a guess with a consent screen attached.
  */
 export const PENDING_SCOPES = {
-  'people.leave.read': {
-    scope: null,
-    product: 'people',
-    endpoint: 'GET /people/api/v3/leave-tracker/leaves',
-    note: 'Endpoint confirmed 200. Authorising scope not recorded — verify in the API console.',
-  },
   'people.attendance.read': {
     scope: null,
     product: 'people',

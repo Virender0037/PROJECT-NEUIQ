@@ -89,7 +89,7 @@ Run this checklist every time, in order:
 5. **Make the smallest safe change.** Match the surrounding idiom — comment density, naming,
    error shapes.
 6. **Run the relevant tests.** `npm run check` from the root, or the individual suite.
-7. **Verify no regressions.** Both suites must stay green at their full counts (113 + 303 + 27 + 61). A test
+7. **Verify no regressions.** All suites must stay green at their full counts (127 + 327 + 4 + 27 + 61). A test
    that starts passing for a new reason is as much a regression as one that fails.
 8. **Update documentation if behaviour changed.** The docs in `docs/` are the specification; if
    you change what the code does, say so there and here.
@@ -139,7 +139,7 @@ Authorization sits **below** routing. Both refusals are independent and both are
 | Frontend | React 18.3, react-router-dom 6.30, Vite 8, plain JS/JSX (no TypeScript) |
 | Frontend styling | No CSS framework, no chart library, no icon library. Inline SVG charts, local Lucide-geometry icon set |
 | Backend | Node ≥20, ES modules, **Express 4.21 — the only runtime dependency** |
-| LLM | Gemini 2.5 Flash via plain `fetch` against the REST endpoint (no SDK). **Optional** |
+| LLM | Gemini 2.5 Flash via plain `fetch` against the REST endpoint (no SDK). **Optional.** **Decided 2026-10-14: the runtime chatbot provider will be the Claude API exclusively; Gemini is retired in a separate AI-provider migration milestone** (not E2.2) |
 | Data source | Zoho People API — **not connected**; `seed.js` stands in |
 | Persistence | File-backed JSON locally; Catalyst Data Store is the target |
 | Tests | No framework. Two plain `node` scripts with `assert/strict` |
@@ -157,7 +157,7 @@ PROJECT-NEUIQ/
 │  ├─ server.js              # local entry; replaced by the Catalyst function handler
 │  ├─ .env.example           # every value optional, all defaulted
 │  ├─ db/dashboards.json     # local file store (gitignored, generated)
-│  ├─ tests/check.mjs        # 113 assertions
+│  ├─ tests/check.mjs        # 127 assertions (+ zoho.check.mjs 327, scale.check.mjs 4)
 │  ├─ evals/                 # EMPTY — intended: labelled utterance -> expected tool
 │  └─ functions/neuiq_api/src/
 │     ├─ app.js                       # every route; thin: parse, delegate, serialize
@@ -207,7 +207,7 @@ PROJECT-NEUIQ/
 ```bash
 npm run install:all      # backend + frontend (frontend uses --legacy-peer-deps)
 npm run dev              # API on :4200, UI on :5174 — Ctrl-C stops both
-npm run check            # 113 backend + 303 zoho + 27 contract + 61 UI assertions
+npm run check            # 127 backend + 327 zoho + 4 scale + 27 contract + 61 UI assertions
 npm run build            # frontend production build
 ```
 
@@ -238,7 +238,7 @@ Add `?ui=hybrid` to the URL to open a specific layout; the choice is remembered.
 | `npm run build` | root | Frontend production build |
 | `npm run dev` | backend | `node --env-file-if-exists=.env --watch server.js` on :4200. Loads `backend/.env` natively (Node ≥22.9); a missing file is fine. `npm start` does **not** load it |
 | `npm start` | backend | `node server.js` |
-| `npm run check` | backend | `node tests/check.mjs && node tests/zoho.check.mjs` — 113 + 303 assertions, exit 1 on failure |
+| `npm run check` | backend | `node tests/check.mjs && node tests/zoho.check.mjs && node --expose-gc tests/scale.check.mjs` — 127 + 327 + 4 assertions, exit 1 on failure |
 | `npm run dev` | frontend | Vite on :5174 (pinned; 5173 belongs to a sibling project) |
 | `npm run check` | frontend | `node test/dashboards.check.mjs && node test/ui.check.mjs` — 27 + 61 assertions |
 | `npm run preview` | frontend | Preview the production build |
@@ -300,7 +300,7 @@ Phase 5.1 was a read-only review of secure Zoho sign-in. Its eight steps, and wh
 | **E3** | Role derivation (`deriveRole`, HR-admin list) and live hierarchy from `Reporting_To.ID` | Not started — needs the HR-admin list decision |
 | **E4** | Server-side session layer (cookies, expiry, logout, CSRF origin check) | Not started — tokens are still bearer tokens in `localStorage` |
 | **E5** | Zoho OIDC (`/auth/zoho/start`, `/auth/zoho/callback`; PKCE, state, nonce) mapped through E2 | Not started — needs a separate Zoho **login** client |
-| **E6** | Frontend Zoho sign-in, cookie requests, no token in `localStorage` | Only the disabled "Continue with Zoho" button (from E1) |
+| **E6** | Frontend Zoho sign-in, cookie requests, no token in `localStorage` — **plus mandatory responsive (320–1440 px) and Light/Dark theme acceptance criteria for Classic and Hybrid** (`docs/frontend/E6-RESPONSIVE-THEME-ACCEPTANCE.md`) | Only the disabled "Continue with Zoho" button (from E1). Responsive/theme: reviewed statically 2026-10-14 — **not met** (Hybrid has no navigation at ≤1024 px; Classic has no responsive layout; no OS-preference default or pre-paint theme); E6 must implement and browser-test |
 | **E7** | One supervised live sign-in to confirm the `sub` format | Not started — needs approval and a test account |
 | **E8** | Catalyst session/handshake store adapter, settings, callback registration | Not started |
 
@@ -308,6 +308,41 @@ Decided so far (E2 brief): first and last names may be stored; only `Employeesta
 `"Active"` counts as active; Zoho `Role`, names, departments and job titles never grant access.
 Still open: the HR-admin list, manager reach, session timeouts, hosting/cookie domain, organisation
 (ZOID) check, seed-owned dashboards on switch-over, the E7 test account.
+
+### E2.2 — environment security, organisation isolation, shared snapshot (2026-10-14)
+
+Full design, measurements and limits: **`docs/backend/17-environment-isolation.md`**.
+
+- **One frozen environment profile** (`core/platform/environment.js`) resolved by `server.js`
+  *before loading the app* and again by `createApp()`: `NEUIQ_ENV` dev | test | prod against
+  `NEUIQ_DATA_SOURCE`, `NEUIQ_AUTH_MODE` and `NODE_ENV`; **`ZOHO_DC` required for live data — no
+  default**; `NEUIQ_ORG_KEY` required for test/prod; a real `AUTH_SECRET` (≥32 random chars, not the
+  demo value or a placeholder) wherever sign-in is not demo; any `NEUIQ_HR_ADMIN*` refused until E3.
+- **Deployment namespace** `dev/seed` or `<env>/zoho-<dc>/<org key>`, bound once per process
+  (`core/platform/deployment.js`); live reads before binding are refused; a process never serves two.
+- **OAuth `api_domain` allow-list**: a token for another DC, or with no domain, is refused before it
+  is cached or used.
+- **Organisation identity is NOT verified** (`organisationVerification: 'unresolved'`): no documented
+  Zoho claim or API identifies the organisation, and no employee-anchor check was built. Production
+  blocker — see doc 17 §3.
+- **Shared employee snapshot** (`people/employeeSnapshot.js`): one single-flight, 5-minute,
+  namespace-bound, all-or-nothing load shared by the E2 directory, the `employees` source,
+  `headcount` and `employeeLookup` (which used to walk Zoho on every call). It grants nothing: every
+  consumer checks the caller first. **Single-instance only.**
+- **Store partitioned by namespace** (`core/platform/store.js`): dev keeps the old path (no
+  migration); test/prod get their own directory with a marker that refuses another namespace, other
+  credentials, or credentials shared with another namespace; an unreadable file is never overwritten.
+
+**E2.2 status (verified 2026-10-15, after a recovery audit):** all **546** automated checks pass
+(127 + 327 + 4 + 27 + 61) and the frontend build succeeds. Still open, none implemented:
+
+| Item | Status |
+| --- | --- |
+| Multi-instance snapshot/caching (shared store + refresh lease) | **Pending** — everything above is single-instance |
+| Organisation verification | **Pending / blocked** — `organisationVerification` is always `'unresolved'` |
+| Live pagination beyond 200 employees | **Pending** — synthetic scale tests only (2–10,000) |
+| E6 responsive layout and Light/Dark theme (Classic, Hybrid) | **Not implemented** — requirements only, `docs/frontend/E6-RESPONSIVE-THEME-ACCEPTANCE.md` |
+| Claude API replacing Gemini | **Not implemented** — Gemini is still the runtime provider |
 
 ### Auth mode (E1 / Phase 5.2, 2026-10-13)
 
@@ -421,10 +456,13 @@ transformers, live sources, live tools, caller-keyed caching.
 
 **Do not treat either as production** until the client confirms the production organisation, its
 DC and its ZOID. The code cannot tell organisations apart today: one `ZOHO_DC` drives both the
-OAuth and API hosts, the token's `api_domain` is ignored, and no ZOID is checked. The code's own
-evidence is still split — `datacenters.js` marks `in` confirmed (and the default) and `com`
-unverified, `scopes.js` still lists the leave scope as pending, while `endpoints.js` records the
-Booked and Balance report as confirmed on `.com`.
+OAuth and API hosts and no ZOID is checked. Since E2.2 the token's `api_domain` must equal the
+allow-listed domain for `ZOHO_DC` — but that proves a **region**, not an organisation. In code
+(E2.2): there is **no DC default** (`ZOHO_DC` is required for live data); `datacenters.js` marks
+`com` confirmed (people host and `api_domain`, test organisation) and `in` confirmed for the people
+host only (curl), its accounts host and `api_domain` unverified; `scopes.js` records
+`ZOHOPEOPLE.forms.READ` and `ZOHOPEOPLE.leave.READ` as granted on `.com`; `endpoints.js` records
+the Booked and Balance report as confirmed on `.com`. All of it is test-organisation evidence.
 
 The app runs on the seed until `NEUIQ_DATA_SOURCE=zoho`. There is **no request-time fallback**
 between them: a Zoho failure is a 503, a 403 stays a 403, and an empty result stays empty.
@@ -543,10 +581,11 @@ limits: (1) Zoho's 7024 is its generic "No records found"; one sent for another 
 a full page would end the walk early and look complete — pinned by a test so it cannot change
 silently. (2) Employees added or removed while the walk runs can shift between pages: duplicates are
 caught, a skipped record is not. (3) A missing page could hide a duplicated ZUID. (4) Each walk of a
-large directory costs up to 51 calls against Zoho's plan-wide daily API limit, and `headcount` and
-`employeeLookup` walk on **every** call (uncached), the `employees` source once per admin per 5 min,
-and the E2 directory once per 5 min — redundant at scale; the shared limiter bounds it by failing
-excess walks, not by sharing one load (E2.2 candidate).
+large directory costs up to 51 calls against Zoho's plan-wide daily API limit. **Since E2.2** all
+four consumers (`headcount`, `employeeLookup`, the `employees` source and the E2 directory) read
+one shared, single-flight snapshot (`people/employeeSnapshot.js`, ≤ 5 min) — at most one walk per
+5 minutes **per process**. Single-instance only: N instances still walk N times until a shared
+store with a refresh lease exists (doc 17 §4).
 
 **Employee output is exactly four fields:** `recordId`, `email`, `department`, `employmentTypeId`.
 `Date_of_birth`, `Gender` and `Photo` are read and deliberately discarded; everything unlisted is
@@ -589,6 +628,10 @@ only the undecidable case is refused. Restored by confirming a reporting field, 
 ---
 
 ## Gemini integration
+
+> **Requirement (2026-10-14):** the runtime chatbot AI provider will be the **Claude API
+> exclusively**; Gemini is to be retired in a separate AI-provider migration milestone. Until that
+> milestone, the code below is unchanged and still the runtime provider.
 
 Optional by design. `orchestrator/llm/gemini.js` calls the REST endpoint with plain `fetch` —
 two calls do not justify an SDK dependency.
@@ -729,10 +772,14 @@ call `app.go('dashboard')` and read `app.view`. `empty` and `chat` deliberately 
 
 ## Data persistence
 
-**Today:** `platform/store.js` — a file-backed JSON store at `backend/db/dashboards.json`
-(gitignored, generated on first run; override with `NEUIQ_DB_DIR`). An in-memory `Map` mirrors it
-so reads do not hit disk. A corrupt file starts empty **and logs a warning** rather than silently
-serving `[]`.
+**Today:** `core/platform/store.js` — a file-backed JSON store, **partitioned by deployment
+namespace** (E2.2). `dev/seed` keeps the original `backend/db/dashboards.json` (gitignored; override
+the root with `NEUIQ_DB_DIR`, read when a collection is opened); every other namespace gets
+`backend/db/ns/<namespace>/`, guarded by a `.namespace.json` marker — so demo dashboards never appear
+in a Zoho deployment, and a directory belonging to another namespace or opened with other
+credentials refuses at startup. An in-memory `Map`, keyed by file, mirrors it so reads do not hit
+disk. **A corrupt file now refuses reads and writes (503) and is never overwritten** — it used to
+start empty, and the next save destroyed the real data.
 
 The wrapper exists because `zcatalyst-sdk-node` only works inside the Catalyst runtime — imported
 directly, the backend could not run or be tested on a laptop. **Swapping to Catalyst Data Store is
@@ -783,14 +830,15 @@ be skipped for want of a bundler. **Do not add imports to `spec.js`.**
 
 ```bash
 npm run check                 # from root: all three suites
-cd backend  && npm run check  # runs BOTH backend suites, in order:
-                              #   tests/check.mjs       ->  "all 113 backend checks pass"
-                              #   tests/zoho.check.mjs  ->  "all 303 zoho integration checks pass"
+cd backend  && npm run check  # runs all THREE backend suites, in order:
+                              #   tests/check.mjs       ->  "all 127 backend checks pass"
+                              #   tests/zoho.check.mjs  ->  "all 327 zoho integration checks pass"
+                              #   tests/scale.check.mjs ->  "all 4 scale checks pass" (synthetic 2–10,000 employees)
 cd frontend && npm run check  #   test/dashboards.check.mjs -> "all 27 contract checks pass"
                               #   test/ui.check.mjs         -> "all 61 UI checks pass"
 ```
 
-**504 assertions total** (113 + 303 + 27 + 61, as of E2.1 employee pagination, 2026-10-14). All three were run and pass at these counts. No framework —
+**546 assertions total** (127 + 327 + 4 + 27 + 61, as of E2.2, 2026-10-14). All were run and pass at these counts; `tests/check.mjs` points the store at a temporary directory, so no suite writes into `backend/db`. No framework —
 plain `assert/strict` against the real modules, exit 1 on any failure. The only stand-in is in
 `test/ui.check.mjs`, which stubs `fetch` (unreachable / 403 / 500 / OK) to run the real API client
 and dashboard layer offline.
@@ -837,11 +885,14 @@ but both would leak environment detail into the repository, so neither belongs i
 | --- | --- | --- |
 | `GEMINI_API_KEY` | *(empty)* | Absent → keyword routing; `/health` says `"keywords only"` |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | |
-| `AUTH_SECRET` | `neuiq-demo-secret-not-for-production` | **Required in anything resembling production** |
+| `NEUIQ_ENV` | *(unset → `dev`, seed only)* | `dev` \| `test` \| `prod`. Checked against data source, auth mode and `NODE_ENV`; unsafe combinations **refused at startup** (E2.2) |
+| `NEUIQ_ORG_KEY` | *(none)* | **Required for test/prod.** Operator label for the Zoho organisation (3–40 lower-case, digits, hyphens); part of the deployment namespace. A label, not a verification |
+| `AUTH_SECRET` | `neuiq-demo-secret-not-for-production` (**demo dev only**) | **Required and validated** wherever sign-in is not demo (zoho mode, test, prod): ≥32 random chars, not the demo value or a placeholder |
 | `NEUIQ_AUTH_MODE` | *(unset → `demo` over seed only)* | `demo` or `zoho`. Unset with live data, `demo` with live data or in production, or any other value: **refused at startup**. See *Auth mode* above |
 | `PORT` | `4200` | 4000 and 4100 belong to sibling projects |
 | `CORS_ORIGINS` | `http://localhost:5173,http://localhost:5174` | Explicit allow-list, never `*` |
-| `NEUIQ_DB_DIR` | `backend/db` | File-store location |
+| `NEUIQ_DB_DIR` | `backend/db` | File-store root; namespaces below it (E2.2) |
+| `ZOHO_DC` | *(none — no default)* | **Required when `NEUIQ_DATA_SOURCE=zoho`**: in \| com \| eu \| au \| jp \| ca \| sa. `com` is verified (test organisation) |
 | `ZOHO_PEOPLE_LEAVE_YEAR_START` | *(unset)* | `MM-DD`, the organisation's leave-year start (from Zoho's leave settings; not readable by API). Unset → live leave balance is **unavailable**, never a guessed calendar year |
 
 **Frontend** (`frontend/.env.example`): `VITE_API_URL`, default `http://localhost:4200/api/v1`
@@ -953,9 +1004,9 @@ Since then, on 2026-10-13 against the `.com` test organisation (read-only, super
 1. **Which organisation is production.** Local credentials (`backend/.env`, gitignored) belong to
    the `.com` test organisation and work; the India organisation's owner and status are
    unconfirmed; no ZOID is recorded for either. Needs the client to name the production
-   organisation, its DC and ZOID before any live switch. The code still marks `com` `unverified`
-   and defaults to `in` (`datacenters.js`, `.env.example`) — update once the mapping is decided,
-   not before.
+   organisation, its DC and ZOID before any live switch. Since E2.2 the code has no DC default
+   (`ZOHO_DC` is required; `.env.example` leaves it blank) and marks `com` confirmed — for the
+   **test** organisation only. Organisation identity remains `unresolved` (doc 17 §3).
 2. **No end-to-end validation.** The chain NeuIQ → backend → Zoho People → transformer → tool → AI
    answer has never run once through the app. Individual client calls have met live `.com`
    responses; the app has never run with `NEUIQ_DATA_SOURCE=zoho`.
@@ -970,9 +1021,9 @@ Since then, on 2026-10-13 against the `.com` test organisation (read-only, super
    `Reporting_To.ID` into authorization.
 6. ~~**Is `recordId` the same identifier as leave's `employee_zoho_ids` (erecno)?**~~ **Yes, on the
    `.com` test organisation** (2026-10-13). Re-check on the production organisation.
-7. **Final OAuth scopes in code.** `ZOHOPEOPLE.leave.READ` was granted on `.com` (2026-10-13) but
-   `scopes.js` still lists leave as `scope: null`; attendance is unobserved. Record them per
-   organisation once production is confirmed.
+7. **Final OAuth scopes in code.** `scopes.js` now records `ZOHOPEOPLE.forms.READ` and
+   `ZOHOPEOPLE.leave.READ` as granted on the `.com` test organisation (E2.2); attendance is
+   unobserved. Re-confirm per organisation once production is confirmed.
 8. **Production identity and authorization hardening** — `16-identity-authorization.md`, per-user
    OAuth, and the `employee_zoho_ids` second fence.
 
@@ -1084,7 +1135,14 @@ demonstrably different, and every gap above either closed or recorded.
 4. **Replace the demo identity stub** with the design from step 3 — E3 to E8 of the *Auth
    roadmap* (E1 and E2 are done).
 5. **Reliability:** rate limiting (doc 07), per-widget caching keyed on the caller, batched widget
-   resolution with per-widget timeouts (doc 15). Retry/backoff and the request cache now exist.
+   resolution with per-widget timeouts (doc 15). Retry/backoff, the request cache and (E2.2) the
+   shared employee snapshot now exist. **Multi-instance:** a shared snapshot store + refresh lease
+   (Catalyst Cache) before running more than one instance (doc 17 §4).
+5a. **Organisation verification** — production blocker (doc 17 §3): needs a Zoho-confirmed
+   organisation identifier (API, scope or token claim) or E7 evidence, plus client confirmation of
+   the production organisation and separate per-environment credentials.
+5b. **Claude API migration** — replace Gemini as the sole runtime chatbot provider (separate
+   milestone; recorded 2026-10-14).
 6. **Deploy to Catalyst**: `catalyst init`, swap `platform/store.js` for Data Store, work the
    deployment checklist.
 7. Fix the vite / plugin-react peer conflict.
@@ -1092,7 +1150,7 @@ demonstrably different, and every gap above either closed or recorded.
 9. Correct the stale documentation flagged in this file (root README backend + Hybrid status;
    ARCHITECTURE.md routing; THEMING.md themes; the three wrong contract-mirror paths; doc 03's
    directory list; doc 09's API surface).
-10. Build the Modern UI style.
+10. **E6 responsive + Light/Dark acceptance criteria** (mandatory, both UIs) — `docs/frontend/E6-RESPONSIVE-THEME-ACCEPTANCE.md`; needs a browser test runner (Playwright). Then build the Modern UI style.
 11. Port `SearchSelect` to replace native `<select>` in Chart Builder.
 12. Split Classic-only fields out of `AppContext` once Modern shows what it needs.
 13. Write Hybrid/Modern architecture, components and theming docs.
@@ -1187,6 +1245,8 @@ demonstrably different, and every gap above either closed or recorded.
 | `docs/frontend/API-INTEGRATION.md` | Client, `useApi`, fallback rules, screen→endpoint map | Current except the `spec.js` path |
 | `docs/frontend/UI-STYLES.md` | Three layouts, seven themes, adding a fourth | **Current** |
 | `docs/backend/15-dashboards.md` | Storage, DSL, sanitize, read-time scoping | Design-current; written before the backend existed, and parts are still ahead of it |
+| `docs/backend/17-environment-isolation.md` | E2.2: environments, OAuth DC checks, organisation-boundary limits, shared snapshot, store namespaces, scalability and API budget | **Current** (2026-10-14) |
+| `docs/frontend/E6-RESPONSIVE-THEME-ACCEPTANCE.md` | Mandatory responsive + Light/Dark acceptance criteria for E6, and the current gaps | **Current** (static review, not browser-tested) |
 | `docs/backend/README.md` | Reading order, the four rules, the blockers | Current except its "designed, not built" status line |
 | `docs/backend/00–14` | The original POC specification | **Pre-pivot.** Aspirational for 05–08; 03 and 09 are outdated |
 | `docs/frontend/{ARCHITECTURE,COMPONENTS,THEMING}.md` | Classic UI only | **Stale** on routing and theming |

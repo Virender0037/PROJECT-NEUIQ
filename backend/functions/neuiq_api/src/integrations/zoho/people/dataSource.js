@@ -24,6 +24,8 @@
  * assertions run in CI. The danger was never the seed; it was the seed being reachable when
  * something else failed.
  */
+import { createHash } from 'node:crypto';
+import { resolveZohoDc } from '../_shared/datacenters.js';
 
 export const SEED = 'seed';
 export const ZOHO = 'zoho';
@@ -99,4 +101,30 @@ export function publicDataSource(resolved) {
   if (resolved?.isZoho === true && resolved?.source === ZOHO) return ZOHO;
   if (resolved?.isSeed === true && resolved?.source === SEED) return SEED;
   return null;
+}
+
+/**
+ * Zoho People's contribution to the startup environment profile (core/platform/environment.js).
+ *
+ * Live Zoho needs an explicit ZOHO_DC — no default (S2). Seed data needs nothing, and a ZOHO_DC
+ * left in a seed .env is ignored, not validated: it selects nothing.
+ *
+ * Returns, for a live deployment:
+ *   zohoDc                 the DC code
+ *   partition              `zoho-<dc>` — this integration's part of the deployment namespace
+ *   credentialFingerprint  first 16 hex of sha256("zoho-people:<dc>:<client id>") — lets the
+ *                          dashboard store notice a deployment reopened with OTHER credentials, or
+ *                          two environments sharing one set. Never the client id, never a secret.
+ */
+export function zohoPeopleEnvironmentCheck(env, { dataSource } = {}) {
+  if (dataSource !== ZOHO) return {};
+  const dc = resolveZohoDc(env).code;
+  const clientId = String(env.ZOHO_CLIENT_ID ?? '').trim();
+  return {
+    zohoDc: dc,
+    partition: `zoho-${dc}`,
+    credentialFingerprint: clientId
+      ? createHash('sha256').update(`zoho-people:${dc}:${clientId}`).digest('hex').slice(0, 16)
+      : null,
+  };
 }

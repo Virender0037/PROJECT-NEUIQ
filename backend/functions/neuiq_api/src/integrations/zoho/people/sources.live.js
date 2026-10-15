@@ -18,11 +18,18 @@
  *
  * ## Caching
  *
- * Keyed by caller, always. Two employees issuing the identical spec must not share a cache entry;
- * that is a data leak rather than a stale read. `cacheKey()` refuses to build a key without a
- * caller, so this cannot be forgotten here.
+ * Keyed by deployment namespace AND caller, always. Two employees issuing the identical spec must
+ * not share a cache entry — that is a data leak rather than a stale read — and no entry may ever be
+ * a hit in another deployment. `scopedCacheKey()` refuses a key without either. A request with no
+ * caller id is refused; there is no 'anonymous' shared key any more (E2.2).
+ *
+ * The `employees` source is the exception that caches NOTHING per caller: it reads the deployment's
+ * shared employee snapshot (employeeSnapshot.js). That snapshot is organisation-wide and server-side;
+ * the source is adminOnly, so the query engine refuses everyone else BEFORE `fetchRows` runs.
  */
-import { cache, cacheKey } from '../../../core/platform/cache.js';
+import { cache, scopedCacheKey } from '../../../core/platform/cache.js';
+import { currentNamespace } from '../../../core/platform/deployment.js';
+import { createEmployeeSnapshot, assertSnapshotNamespace } from './employeeSnapshot.js';
 import { transformLeaveRecords } from './transformers/leave.js';
 import { transformEmployeeRecords } from './transformers/employee.js';
 import { AttendanceTransformerPendingError } from './transformers/attendance.js';
@@ -44,10 +51,25 @@ function defaultWindow(now = new Date()) {
   return { from: iso(from), to: iso(to) };
 }
 
-export function buildLiveSources({ client, now = () => new Date() }) {
-  /** Cache a fetch under a caller-scoped key. */
-  const cached = (user, parts, loader) =>
-    cache.wrap(cacheKey(user?.employeeId || 'anonymous', ...parts), TTL_SECONDS, loader);
+/**
+ * @param client            the People client
+ * @param namespace         the deployment namespace, or a resolver; defaults to the process's bound
+ *                          deployment (core/platform/deployment.js) — refused while unbound
+ * @param employeeSnapshot  the deployment's SHARED employee snapshot; a private one is made if absent
+ */
+export function buildLiveSources({ client, now = () => new Date(), namespace = currentNamespace, employeeSnapshot = null }) {
+  const ns = () => (typeof namespace === 'function' ? namespace() : namespace);
+  const snapshot = employeeSnapshot ?? createEmployeeSnapshot({ loadRecords: () => client.employees(), namespace: ns });
+  /** The transformed directory, computed once per snapshot rather than once per query. */
+  const transformed = new WeakMap();
+
+  /** Cache a fetch under a namespace- and caller-scoped key. No caller, no cache, no read. */
+  const cached = (user, parts, loader) => {
+    if (!user?.employeeId) {
+      throw Object.assign(new Error('Sign in to continue.'), { status: 401 });
+    }
+    return cache.wrap(scopedCacheKey(ns(), user.employeeId, ...parts), TTL_SECONDS, loader);
+  };
 
   return {
     leave: {
@@ -82,13 +104,14 @@ export function buildLiveSources({ client, now = () => new Date() }) {
     employees: {
       ...PEOPLE_SOURCES.employees,
       rows: undefined,
-      async fetchRows({ user, signal }) {
-        // Every page or a throw (people/client.js) — a failed walk is never cached (cache.wrap
-        // keeps no rejection), so the next request walks again instead of serving a partial list.
-        return cached(user, ['employees'], async () => {
-          const raw = await client.employees({ signal });
-          return transformEmployeeRecords(raw);
-        });
+      async fetchRows({ user }) {
+        // The shared snapshot: complete or an error (people/client.js + employeeSnapshot.js) — a
+        // failed load is never stored, and a snapshot from another namespace is refused. Nothing
+        // here is per caller: the engine has already refused every non-admin (adminOnly source).
+        if (!user?.employeeId) throw Object.assign(new Error('Sign in to continue.'), { status: 401 });
+        const snap = assertSnapshotNamespace(await snapshot.get(), ns);
+        if (!transformed.has(snap)) transformed.set(snap, transformEmployeeRecords(snap.rows));
+        return transformed.get(snap);
       },
     },
   };

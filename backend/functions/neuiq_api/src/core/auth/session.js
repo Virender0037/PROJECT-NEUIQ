@@ -20,7 +20,42 @@
  */
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
-const SECRET = () => process.env.AUTH_SECRET || 'neuiq-demo-secret-not-for-production';
+/**
+ * The demo fallback. Public — it is in this file — so it may only ever sign DEMO tokens over seed
+ * data. Anything that could protect non-demo authentication must have a real AUTH_SECRET; the
+ * startup profile (core/platform/environment.js) refuses to boot otherwise (S7).
+ */
+export const DEMO_SIGNING_SECRET = 'neuiq-demo-secret-not-for-production';
+
+const SECRET = () => process.env.AUTH_SECRET || DEMO_SIGNING_SECRET;
+
+/** Minimum AUTH_SECRET length where one is required. 32+ random bytes, base64url, is ~43 chars. */
+export const MIN_SIGNING_SECRET_LENGTH = 32;
+/** Fewer distinct characters than this is a repeated or patterned string, not a random one. */
+const MIN_DISTINCT_CHARACTERS = 12;
+/** Fragments that mark a value someone copied from an example instead of generating. */
+const PLACEHOLDER = /(change[-_ ]?me|replace|placeholder|example|your[-_ ]?secret|secret[-_ ]?here|not[-_ ]?for[-_ ]?production|dummy|default|password|todo|xxxx|^<.*>$)/i;
+
+/**
+ * Why a signing secret is unacceptable, as a code — or null when it is acceptable.
+ *
+ *   missing       unset or blank
+ *   demo-default  the public demo fallback above
+ *   too-short     under MIN_SIGNING_SECRET_LENGTH characters
+ *   placeholder   copied from an example ("changeme", "<your-secret>", "…example…")
+ *   predictable   too few distinct characters to be random ("aaaa…", "abcabc…")
+ *
+ * Returns a CODE, never the value or its length: the caller's message must not help anyone guess it.
+ */
+export function signingSecretProblem(value) {
+  const s = value === undefined || value === null ? '' : String(value);
+  if (!s.trim()) return 'missing';
+  if (s === DEMO_SIGNING_SECRET) return 'demo-default';
+  if (s.length < MIN_SIGNING_SECRET_LENGTH) return 'too-short';
+  if (PLACEHOLDER.test(s)) return 'placeholder';
+  if (new Set(s).size < MIN_DISTINCT_CHARACTERS) return 'predictable';
+  return null;
+}
 
 const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
 const sign = (body) => createHmac('sha256', SECRET()).update(body).digest('base64url');

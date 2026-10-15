@@ -49,8 +49,8 @@
  * already shaped for it — `getAccessToken({ dc })` becomes `getAccessToken({ dc, connection })`
  * and the cache key widens — so adopting it is an extension, not a rewrite.
  */
-import { accountsBase, DEFAULT_DC } from './datacenters.js';
-import { mapHttpError, mapNetworkError, ZohoAuthError, redact } from './errors.js';
+import { accountsBase, expectedApiDomain } from './datacenters.js';
+import { mapHttpError, mapNetworkError, ZohoAuthError, ZohoError, redact } from './errors.js';
 
 /** Treat a token as expired this many ms early, so it cannot die in flight. */
 const EXPIRY_SKEW_MS = 120_000;
@@ -64,10 +64,14 @@ const TOKEN_TIMEOUT_MS = 10_000;
  * Returns what is present without throwing, so a caller can ask "is this configured?" and get an
  * answer instead of an exception. Values are never logged, and this object should not be either —
  * pass `describeConfig()` to a log line instead.
+ *
+ * `dc` is null when ZOHO_DC is unset — never a default. Live Zoho refuses to start without it
+ * (`resolveZohoDc` in datacenters.js); a token request with no DC throws in `accountsBase`.
  */
 export function configFromEnv(env = process.env) {
+  const dc = env.ZOHO_DC === undefined || env.ZOHO_DC === null ? '' : String(env.ZOHO_DC).trim().toLowerCase();
   return {
-    dc: String(env.ZOHO_DC || DEFAULT_DC).trim().toLowerCase(),
+    dc: dc || null,
     clientId: env.ZOHO_CLIENT_ID || null,
     clientSecret: env.ZOHO_CLIENT_SECRET || null,
     refreshToken: env.ZOHO_REFRESH_TOKEN || null,
@@ -155,6 +159,20 @@ export function createTokenProvider({
     if (payload?.error || !payload?.access_token) {
       throw new ZohoAuthError(
         typeof payload?.error === 'string' ? payload.error : 'Zoho did not return an access token.',
+      );
+    }
+
+    // The token must belong to the configured data centre (E2.2). Zoho names the API domain a
+    // token is for; anything but the exact allow-listed domain for ZOHO_DC — or no domain at all —
+    // is refused here, BEFORE the token is cached or sent anywhere. The received value is not
+    // logged or echoed: it is untrusted input.
+    const expected = expectedApiDomain(dc);
+    if (payload.api_domain !== expected) {
+      const code = payload.api_domain ? 'API_DOMAIN_MISMATCH' : 'API_DOMAIN_MISSING';
+      log('zoho.token.refused', { dc, code });
+      throw new ZohoError(
+        `The Zoho token is not for the configured data centre (ZOHO_DC=${dc}). Check that ZOHO_DC matches where the OAuth client was created.`,
+        { status: 503, code },
       );
     }
 

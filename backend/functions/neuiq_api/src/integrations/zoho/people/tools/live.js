@@ -36,7 +36,9 @@ import {
 } from '../transformers/balance.js';
 import { leaveBalancePeriod, LEAVE_YEAR_ENV } from '../leaveYear.js';
 import { defaultWindow } from '../sources.live.js';
-import { cache as sharedCache, cacheKey } from '../../../../core/platform/cache.js';
+import { cache as sharedCache, scopedCacheKey } from '../../../../core/platform/cache.js';
+import { currentNamespace } from '../../../../core/platform/deployment.js';
+import { createEmployeeSnapshot, assertSnapshotNamespace } from '../employeeSnapshot.js';
 
 /** A balance changes when leave is booked or approved — minutes, not seconds, is fresh enough. */
 export const BALANCE_TTL_SECONDS = 300;
@@ -44,12 +46,33 @@ export const BALANCE_TTL_SECONDS = 300;
 /** Reuse the seed tool's declaration, replace only its body. Keeps the contract identical. */
 const from = (name, run) => ({ ...PEOPLE_TOOLS[name], run });
 
+/**
+ * @param namespace         the deployment namespace, or a resolver; defaults to the process's bound
+ *                          deployment (core/platform/deployment.js) — refused while unbound
+ * @param employeeSnapshot  the deployment's SHARED employee snapshot (E2.2): `headcount` and
+ *                          `employeeLookup` read it instead of walking Zoho on every call. A private
+ *                          one is made when absent. It grants nothing — each tool still applies the
+ *                          caller's reach before reading (admin-only `headcount` via mayCall,
+ *                          `teamOf` before `employeeLookup` reads anything).
+ */
 export function buildLiveTools({
   client,
   now = () => new Date(),
   leaveYearStart = undefined,
   balanceCache = sharedCache,
+  namespace = currentNamespace,
+  employeeSnapshot = null,
 }) {
+  const ns = () => (typeof namespace === 'function' ? namespace() : namespace);
+  const snapshot = employeeSnapshot ?? createEmployeeSnapshot({ loadRecords: () => client.employees(), namespace: ns });
+  /** The transformed directory, once per snapshot — never per caller, and never returned whole. */
+  const transformed = new WeakMap();
+  async function employeeRows() {
+    const snap = assertSnapshotNamespace(await snapshot.get(), ns);
+    if (!transformed.has(snap)) transformed.set(snap, transformEmployeeRecords(snap.rows));
+    return transformed.get(snap);
+  }
+
   /** Leave rows for one employee over the default window, already normalized. */
   async function leaveFor(employeeId, signal) {
     const { from: f, to } = defaultWindow(now());
@@ -91,7 +114,7 @@ export function buildLiveTools({
 
       // Caller AND subject AND period: a manager's cached view of a report never answers the
       // report themselves, and last leave year's figures never answer this one.
-      const key = cacheKey(user.employeeId, 'leave-balance', id, period.from, period.to);
+      const key = scopedCacheKey(ns(), user.employeeId, 'leave-balance', id, period.from, period.to);
       const rows = await balanceCache.wrap(key, BALANCE_TTL_SECONDS, async () => transformLeaveBalanceReport(
         await client.leaveBalance({ employeeId: id, from: period.from, to: period.to }),
         { employeeId: id },
@@ -165,7 +188,7 @@ export function buildLiveTools({
     'zohoPeople.headcount': from('zohoPeople.headcount', async ({ groupBy }, _user) => {
       const requested = String(groupBy || 'department');
       const key = requested === 'department' ? 'department' : 'department';
-      const rows = transformEmployeeRecords(await client.employees({}));
+      const rows = await employeeRows();
       const counts = new Map();
       for (const e of rows) counts.set(e.department ?? '—', (counts.get(e.department ?? '—') || 0) + 1);
       return {
@@ -190,7 +213,7 @@ export function buildLiveTools({
       // Yourself and your direct reports, or everyone for an HR admin. Decided before the fetch.
       const reach = teamOf(user, { includeSelf: true });
       const q = String(name).toLowerCase();
-      const rows = transformEmployeeRecords(await client.employees({}));
+      const rows = await employeeRows();
       const hits = rows
         .filter((e) => isWithin(reach, e.recordId))
         .filter((e) => String(e.email ?? '').toLowerCase().includes(q))

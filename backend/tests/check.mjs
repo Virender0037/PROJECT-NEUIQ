@@ -34,11 +34,25 @@ import { buildSeed, onLeaveToday } from '../functions/neuiq_api/src/integrations
 import { resolveDataSource, publicDataSource } from '../functions/neuiq_api/src/integrations/zoho/people/dataSource.js';
 import { createApp } from '../functions/neuiq_api/src/app.js';
 import { resolveAuthMode } from '../functions/neuiq_api/src/core/auth/mode.js';
+import { resolveEnvironmentProfile, describeEnvironment, ENVIRONMENTS } from '../functions/neuiq_api/src/core/platform/environment.js';
+import { signingSecretProblem, DEMO_SIGNING_SECRET, MIN_SIGNING_SECRET_LENGTH } from '../functions/neuiq_api/src/core/auth/session.js';
+import { ENVIRONMENT_CHECKS } from '../functions/neuiq_api/src/integrations/environmentChecks.js';
+import { collection, namespaceDir, StoreError, LEGACY_NAMESPACE } from '../functions/neuiq_api/src/core/platform/store.js';
+import { boundDeployment } from '../functions/neuiq_api/src/core/platform/deployment.js';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { LEAVE_STATUS, countWithStatus } from '../functions/neuiq_api/src/integrations/zoho/people/leaveStatus.js';
 
 let n = 0;
+
+// E2.2: the store resolves NEUIQ_DB_DIR when a collection is opened. Point it at a fresh temporary
+// directory before any app is built, so this suite never writes into a real backend/db.
+const STORE_ROOT = mkdtempSync(join(tmpdir(), 'neuiq-check-'));
+process.env.NEUIQ_DB_DIR = STORE_ROOT;
 const ok = (fn, what) => { fn(); n++; console.log('ok  ', what); };
 const throws = (fn, what) => { assert.throws(fn); n++; console.log('ok  ', what); };
 
@@ -549,9 +563,244 @@ ok(() => {
   }
 }, 'auth mode: node server.js refuses to start for invalid modes, demo over live data, and demo in production');
 
+/** A synthetic signing secret that passes S7 — never a real one. */
+const TEST_SIGNING_SECRET = 'k7Qw2Lp9Zr4Xv8Nc1Ty6Bm3Hs5Jd0FgEaU';
+/** Run `fn` with AUTH_SECRET set to `value` (undefined = unset), restoring the previous value. */
+const withAuthSecret = (value, fn) => {
+  const prev = process.env.AUTH_SECRET;
+  if (value === undefined) delete process.env.AUTH_SECRET; else process.env.AUTH_SECRET = value;
+  try { return fn(); } finally { if (prev === undefined) delete process.env.AUTH_SECRET; else process.env.AUTH_SECRET = prev; }
+};
+
+
+// ---------------------------------------------------------------- environment profile (E2.2 Part 1)
+const STRONG = 'k7Qw2Lp9Zr4Xv8Nc1Ty6Bm3Hs5Jd0FgEaU';
+const profileOf = (env, dataSource) => resolveEnvironmentProfile(env, { dataSource, integrationChecks: ENVIRONMENT_CHECKS });
+const refusal = (env, dataSource) => { try { profileOf(env, dataSource); return null; } catch (e) { return e.message; } };
+const LIVE_TEST = { NEUIQ_ENV: 'test', NEUIQ_AUTH_MODE: 'zoho', ZOHO_DC: 'com', NEUIQ_ORG_KEY: 'acme-test', AUTH_SECRET: STRONG, ZOHO_CLIENT_ID: '1000.TEST_CLIENT' };
+const LIVE_PROD = { ...LIVE_TEST, NEUIQ_ENV: 'prod', NODE_ENV: 'production', NEUIQ_ORG_KEY: 'acme-prod' };
+
+ok(() => {
+  const dev = profileOf({}, 'seed');
+  assert.equal(dev.environment, 'dev');
+  assert.equal(dev.auth.mode, 'demo');
+  assert.equal(dev.signingSecret, 'demo', 'demo sign-in tolerates the public fallback');
+  assert.equal(dev.namespace, 'dev/seed');
+  assert.equal(dev.organisationVerification, 'not-applicable');
+  assert.ok(Object.isFrozen(dev) && Object.isFrozen(dev.auth) && Object.isFrozen(dev.integrations));
+  // The developer's own seed .env (ZOHO_DC=com plus credentials, nothing else) keeps working.
+  const local = profileOf({ NEUIQ_DATA_SOURCE: 'seed', ZOHO_DC: 'com', ZOHO_CLIENT_ID: 'x', ZOHO_CLIENT_SECRET: 'y', ZOHO_REFRESH_TOKEN: 'z' }, 'seed');
+  assert.equal(local.namespace, 'dev/seed');
+  assert.deepEqual({ ...local.integrations }, {}, 'seed: ZOHO_DC and credentials are ignored, not validated');
+  assert.equal(profileOf({ NEUIQ_ENV: ' DEV ' }, 'seed').environment, 'dev', 'trimmed, case-insensitive');
+  assert.deepEqual([...ENVIRONMENTS], ['dev', 'test', 'prod']);
+}, 'E2.2 profile: dev over seed data with demo sign-in is unchanged — namespace dev/seed, frozen');
+
+ok(() => {
+  const t = profileOf(LIVE_TEST, 'zoho');
+  assert.equal(t.environment, 'test');
+  assert.equal(t.auth.mode, 'zoho');
+  assert.equal(t.integrations.zohoDc, 'com');
+  assert.equal(t.namespace, 'test/zoho-com/acme-test');
+  assert.equal(t.organisationVerification, 'unresolved', 'never "verified"');
+  assert.equal(t.signingSecret, 'required');
+  const p = profileOf(LIVE_PROD, 'zoho');
+  assert.equal(p.environment, 'prod');
+  assert.equal(p.namespace, 'prod/zoho-com/acme-prod');
+  assert.notEqual(p.namespace, t.namespace, 'test and production are always different partitions');
+  assert.equal(JSON.stringify(t).includes(STRONG), false, 'the profile never carries the secret');
+  assert.equal(JSON.stringify(t).includes('TEST_CLIENT'), false, 'nor the client id');
+  assert.ok(describeEnvironment(t).includes('NOT verified'));
+  const devZoho = profileOf({ NEUIQ_AUTH_MODE: 'zoho', AUTH_SECRET: STRONG }, 'seed');
+  assert.equal(devZoho.namespace, 'dev/seed');
+}, 'E2.2 profile: test and prod over live Zoho resolve to distinct namespaces; organisation verification stays "unresolved"');
+
+ok(() => {
+  for (const [env, why] of [
+    [{ ...LIVE_TEST, ZOHO_DC: undefined }, 'ZOHO_DC is required'],
+    [{ ...LIVE_TEST, ZOHO_DC: '' }, 'ZOHO_DC is required'],
+    [{ ...LIVE_TEST, ZOHO_DC: 'xx' }, 'unknown data centre'],
+    [{ ...LIVE_TEST, ZOHO_DC: 'us' }, 'unknown data centre'],
+  ]) assert.ok(refusal(env, 'zoho')?.includes(why), `${JSON.stringify(env.ZOHO_DC)} -> ${why}`);
+}, 'E2.2 profile: live Zoho without a valid ZOHO_DC refuses — nothing defaults to India');
+
+ok(() => {
+  assert.ok(refusal({ NEUIQ_AUTH_MODE: 'demo', NODE_ENV: 'production' }, 'seed')?.includes('not allowed with NODE_ENV=production'));
+  assert.ok(refusal({ NODE_ENV: 'production' }, 'seed'), 'implicit demo in production');
+  assert.ok(refusal({ ...LIVE_PROD, NEUIQ_ENV: undefined }, 'zoho')?.includes('NODE_ENV=production requires NEUIQ_ENV=prod'));
+  assert.ok(refusal({ ...LIVE_PROD, NEUIQ_ENV: 'test' }, 'zoho')?.includes('NODE_ENV=production requires NEUIQ_ENV=prod'));
+  assert.ok(refusal({ ...LIVE_TEST, NEUIQ_ENV: 'prod' }, 'zoho')?.includes('NEUIQ_ENV=prod requires NODE_ENV=production'));
+  assert.ok(refusal({ NEUIQ_ENV: 'prod', NODE_ENV: 'production', NEUIQ_AUTH_MODE: 'zoho', AUTH_SECRET: STRONG }, 'seed'), 'prod over seed');
+  assert.ok(refusal({ ...LIVE_TEST, NEUIQ_AUTH_MODE: 'demo' }, 'zoho'), 'demo over live data');
+}, 'E2.2 profile: demo in production, production without prod, and prod without production all refuse');
+
+ok(() => {
+  assert.ok(refusal({ NEUIQ_ENV: 'dev', NEUIQ_AUTH_MODE: 'zoho', AUTH_SECRET: STRONG, ZOHO_DC: 'com', NEUIQ_ORG_KEY: 'acme-test' }, 'zoho')?.includes('NEUIQ_ENV=dev runs on seed data only'));
+  assert.ok(refusal({ NEUIQ_ENV: 'test' }, 'seed')?.includes('NEUIQ_ENV=test requires NEUIQ_DATA_SOURCE=zoho'));
+  assert.ok(refusal({ ...LIVE_TEST, NEUIQ_ENV: undefined }, 'zoho')?.includes('NEUIQ_ENV is unset and the data source is not seed'));
+  for (const bad of ['staging', 'production', 'local', 'dev,test']) {
+    assert.ok(refusal({ ...LIVE_TEST, NEUIQ_ENV: bad }, 'zoho')?.includes('NEUIQ_ENV must be one of dev | test | prod'), bad);
+  }
+  const pasted = `${'x'.repeat(20)}SHOULD_NOT_BE_ECHOED`;
+  assert.equal(refusal({ NEUIQ_ENV: pasted }, 'seed').includes('SHOULD_NOT_BE_ECHOED'), false, 'clipped');
+  assert.ok(refusal(LIVE_TEST, null), 'an unknown data source is never treated as seed');
+}, 'E2.2 profile: environment and data source must agree — dev is seed-only, test/prod are live-only, unset is dev over seed only');
+
+ok(() => {
+  assert.ok(refusal({ ...LIVE_TEST, NEUIQ_ORG_KEY: undefined }, 'zoho')?.includes('NEUIQ_ORG_KEY is required'));
+  for (const bad of ['AB', 'Acme-Test', 'acme_test', '-acme', 'acme-', 'a'.repeat(41), 'acme test', '../prod']) {
+    assert.ok(refusal({ ...LIVE_TEST, NEUIQ_ORG_KEY: bad }, 'zoho')?.includes('NEUIQ_ORG_KEY must be'), bad);
+  }
+  assert.equal(profileOf({ NEUIQ_ORG_KEY: 'whatever' }, 'seed').namespace, 'dev/seed', 'ignored over seed');
+}, 'E2.2 profile: live deployments need a valid NEUIQ_ORG_KEY partition label — missing or malformed refuses');
+
+ok(() => {
+  for (const key of ['NEUIQ_HR_ADMIN_RECORD_IDS', 'NEUIQ_HR_ADMIN_ZUIDS', 'neuiq_hr_admins']) {
+    assert.ok(refusal({ [key]: '555000000000000001' }, 'seed')?.includes('not supported until E3'), key);
+    assert.ok(refusal({ ...LIVE_TEST, [key]: '555000000000000001' }, 'zoho')?.includes('not supported until E3'), key);
+  }
+  assert.equal(refusal({ NEUIQ_HR_ADMIN_RECORD_IDS: '  ' }, 'seed'), null, 'an empty value is unset');
+}, 'E2.2 profile: an HR-admin setting is refused until E3 — it cannot silently look as if it works, or carry to another organisation');
+
+// ---------------------------------------------------------------- signing secret (S7)
+ok(() => {
+  const cases = {
+    missing: [undefined, null, '', '   '],
+    'demo-default': [DEMO_SIGNING_SECRET],
+    'too-short': ['Zr4Xv8Nc1Ty6Bm3Hs5', 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P'],
+    placeholder: ['changeme-changeme-changeme-changeme-x1', '<your-secret-goes-here-generate-it-please>', 'replace-this-with-a-real-secret-0123456789', 'example-signing-secret-abcdefghijklmnopq', 'password1234567890ABCDEFGHIJKLMNOPQR'],
+    predictable: ['a'.repeat(64), 'ab'.repeat(32), '0123456789'.repeat(4)],
+  };
+  for (const [code, values] of Object.entries(cases)) {
+    for (const v of values) assert.equal(signingSecretProblem(v), code, `${code}: ${String(v).slice(0, 12)}`);
+  }
+  for (const good of [STRONG, randomBytes(48).toString('base64url'), randomBytes(32).toString('hex')]) {
+    assert.equal(signingSecretProblem(good), null);
+  }
+  assert.equal(MIN_SIGNING_SECRET_LENGTH, 32);
+}, 'S7: missing, demo-default, short, placeholder and predictable secrets are classified; random 32+ char secrets pass');
+
+ok(() => {
+  for (const bad of [undefined, DEMO_SIGNING_SECRET, 'short-Zr4Xv8', 'changeme-changeme-changeme-changeme-x1', 'q'.repeat(50)]) {
+    for (const [env, ds] of [[{ ...LIVE_TEST, AUTH_SECRET: bad }, 'zoho'], [{ ...LIVE_PROD, AUTH_SECRET: bad }, 'zoho'], [{ NEUIQ_AUTH_MODE: 'zoho', AUTH_SECRET: bad }, 'seed']]) {
+      const msg = refusal(env, ds);
+      assert.ok(msg?.includes('AUTH_SECRET'), `${env.NEUIQ_ENV ?? 'dev'}: refused`);
+      if (bad && bad.length > 3) assert.equal(msg.includes(bad), false, 'the secret is never echoed');
+    }
+  }
+  // Demo dev is unchanged: no secret, or a weak one, is tolerated there.
+  for (const anything of [undefined, 'short', DEMO_SIGNING_SECRET]) assert.equal(refusal({ AUTH_SECRET: anything }, 'seed'), null);
+}, 'S7: any non-demo sign-in (zoho mode, test, prod) refuses a weak secret without echoing it; demo dev is unaffected');
+
+ok(() => {
+  withAuthSecret(undefined, () => assert.throws(() => createApp({ authMode: 'zoho' }), /AUTH_SECRET is not set/));
+  withAuthSecret('changeme-changeme-changeme-changeme-x1', () => assert.throws(() => createApp({ authMode: 'zoho' }), /placeholder/));
+  withAuthSecret(STRONG, () => assert.ok(createApp({ authMode: 'zoho' })));
+  assert.equal(boundDeployment()?.namespace, 'dev/seed', 'createApp() bound this process to its deployment');
+}, 'E2.2: createApp() applies the same profile as server.js — a weak secret refuses, a strong one builds, and the deployment is bound');
+
+ok(() => {
+  const fakeZoho = { ZOHO_CLIENT_ID: '1000.FAKE_CLIENT_ID', ZOHO_CLIENT_SECRET: 'FAKE_CLIENT_SECRET_VALUE', ZOHO_REFRESH_TOKEN: '1000.FAKE_REFRESH_TOKEN' };
+  const live = { NEUIQ_DATA_SOURCE: 'zoho', NEUIQ_AUTH_MODE: 'zoho', NEUIQ_ENV: 'test', ZOHO_DC: 'com', NEUIQ_ORG_KEY: 'acme-test', AUTH_SECRET: STRONG, ...fakeZoho };
+  const cases = [
+    [{ ...live, ZOHO_DC: undefined }, 'ZOHO_DC is required'],
+    [{ ...live, ZOHO_DC: 'xx' }, 'unknown data centre'],
+    [{ ...live, AUTH_SECRET: 'changeme-changeme-changeme-changeme-x1' }, 'placeholder'],
+    [{ ...live, NEUIQ_ENV: undefined }, 'NEUIQ_ENV is unset'],
+    [{ ...live, NEUIQ_ORG_KEY: undefined }, 'NEUIQ_ORG_KEY is required'],
+    [{ ...live, NEUIQ_ENV: 'dev' }, 'NEUIQ_ENV=dev runs on seed data only'],
+    [{ ...live, NODE_ENV: 'production' }, 'NODE_ENV=production requires NEUIQ_ENV=prod'],
+    [{ ...live, NEUIQ_HR_ADMIN_RECORD_IDS: '555000000000000001' }, 'not supported until E3'],
+  ];
+  for (const [vars, why] of cases) {
+    const env = Object.fromEntries(Object.entries(vars).filter(([, v]) => v !== undefined));
+    const r = boot(env);
+    assert.equal(r.code, 1, why);
+    assert.ok(r.out.includes('NeuIQ API refused to start') && r.out.includes(why), `${why}: ${r.out.slice(0, 300)}`);
+    assert.equal(r.out.includes('NeuIQ API on http'), false, 'never listened');
+    assert.equal(/\n\s+at /.test(r.out), false, 'a one-line reason, not a stack trace from inside an import');
+    for (const secret of [...Object.values(fakeZoho), STRONG, 'changeme-changeme']) assert.equal(r.out.includes(secret), false, 'no credential or secret in the output');
+  }
+}, 'E2.2: node server.js refuses every unsafe live configuration BEFORE loading the app — one sanitised line, no credentials');
+
+// ---------------------------------------------------------------- dashboard store isolation (Part 5)
+ok(() => {
+  // Pre-E2.2 local data: a dashboards.json at the store root, owned by a seed account, no marker.
+  const root = mkdtempSync(join(tmpdir(), 'neuiq-store-'));
+  const legacyRows = [{ id: 'dash_legacy', ownerId: 'E1001', title: 'My old demo board', widgets: [] }];
+  const legacyText = JSON.stringify(legacyRows, null, 2);
+  writeFileSync(join(root, 'dashboards.json'), legacyText);
+  const prev = process.env.NEUIQ_DB_DIR;
+  process.env.NEUIQ_DB_DIR = root;
+  try {
+    const dev = collection('dashboards', { namespace: LEGACY_NAMESPACE });
+    assert.deepEqual(dev.listByOwner('E1001').map((r) => r.id), ['dash_legacy'], 'dev keeps its existing dashboards, in place');
+    assert.equal(readFileSync(join(root, 'dashboards.json'), 'utf8'), legacyText, 'the legacy file is untouched — no migration');
+    assert.equal(JSON.parse(readFileSync(join(root, '.namespace.json'), 'utf8')).adoptedLegacyFiles, true);
+
+    const test = collection('dashboards', { namespace: 'test/zoho-com/acme-test', bindings: { credentialFingerprint: 'aaaaaaaaaaaaaaaa' } });
+    assert.deepEqual(test.listByOwner('E1001'), [], 'a Zoho test deployment never sees demo dashboards');
+    assert.deepEqual(test.all(), []);
+    test.insert({ id: 'dash_t1', ownerId: '555000000000000001', title: 'Test org board', widgets: [] });
+    assert.equal(readFileSync(join(root, 'dashboards.json'), 'utf8'), legacyText, 'writing in test never touches the dev file');
+    assert.ok(existsSync(join(namespaceDir('test/zoho-com/acme-test', root), 'dashboards.json')));
+    assert.deepEqual(dev.all().map((r) => r.id), ['dash_legacy'], 'and dev never sees the test row');
+  } finally { process.env.NEUIQ_DB_DIR = prev; }
+}, 'Part 5: legacy dev dashboards stay in place and visible to dev only; test/prod use their own partition and never see them');
+
+ok(() => {
+  const root = mkdtempSync(join(tmpdir(), 'neuiq-store-'));
+  const prev = process.env.NEUIQ_DB_DIR;
+  process.env.NEUIQ_DB_DIR = root;
+  const code = (fn) => { try { fn(); return 'opened'; } catch (e) { return e instanceof StoreError ? e.code : e.message; } };
+  try {
+    // A directory whose marker names ANOTHER namespace.
+    const dir = namespaceDir('prod/zoho-com/acme-prod', root);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '.namespace.json'), JSON.stringify({ namespace: 'test/zoho-com/acme-test' }));
+    assert.equal(code(() => collection('dashboards', { namespace: 'prod/zoho-com/acme-prod' })), 'STORE_NAMESPACE_MISMATCH');
+
+    // Reopened with OTHER credentials.
+    assert.equal(code(() => collection('dashboards', { namespace: 'test/zoho-com/acme-test', bindings: { credentialFingerprint: '1111111111111111' } })), 'opened');
+    assert.equal(code(() => collection('dashboards', { namespace: 'test/zoho-com/acme-test', bindings: { credentialFingerprint: '2222222222222222' } })), 'STORE_CREDENTIALS_CHANGED');
+
+    // Two environments sharing ONE set of credentials.
+    assert.equal(code(() => collection('dashboards', { namespace: 'prod/zoho-com/other-prod', bindings: { credentialFingerprint: '1111111111111111' } })), 'STORE_CREDENTIALS_SHARED');
+
+    // Data of unknown origin in a live partition.
+    const orphan = namespaceDir('test/zoho-in/orphan', root);
+    mkdirSync(orphan, { recursive: true });
+    writeFileSync(join(orphan, 'dashboards.json'), '[]');
+    assert.equal(code(() => collection('dashboards', { namespace: 'test/zoho-in/orphan' })), 'STORE_UNMARKED_DATA');
+
+    // Invalid namespaces.
+    for (const bad of [undefined, '', 'dev', '../etc', 'Test/Zoho', 'test//x']) {
+      assert.equal(code(() => collection('dashboards', { namespace: bad })), 'STORE_NAMESPACE_INVALID', String(bad));
+    }
+  } finally { process.env.NEUIQ_DB_DIR = prev; }
+}, 'Part 5: a mismatched namespace marker, changed or shared credentials, unmarked live data and invalid namespaces all refuse');
+
+ok(() => {
+  const root = mkdtempSync(join(tmpdir(), 'neuiq-store-'));
+  const corrupt = '[{"id":"dash_1","ownerId":"E1001",  <-- truncated by a crash';
+  writeFileSync(join(root, 'dashboards.json'), corrupt);
+  const prev = process.env.NEUIQ_DB_DIR;
+  process.env.NEUIQ_DB_DIR = root;
+  try {
+    const dev = collection('dashboards', { namespace: LEGACY_NAMESPACE });
+    for (const op of [() => dev.all(), () => dev.listByOwner('E1001'), () => dev.insert({ id: 'x', ownerId: 'E1001' }), () => dev.remove('E1001', 'dash_1')]) {
+      assert.throws(op, (e) => e.code === 'STORE_UNREADABLE' && e.status === 503);
+    }
+    assert.equal(readFileSync(join(root, 'dashboards.json'), 'utf8'), corrupt, 'the unreadable data was NOT overwritten');
+  } finally { process.env.NEUIQ_DB_DIR = prev; }
+}, 'Part 5: an unreadable dashboards file refuses reads and writes (503) and is never overwritten with []');
+
 const runAuthHttp = async () => {
   const serve = async (authMode) => {
-    const server = createApp(authMode === undefined ? {} : { authMode }).listen(0);
+    // CHANGED in E2.2A-1: zoho sign-in mode now requires a real AUTH_SECRET at startup (S7), even
+    // over seed data — so the zoho-mode app is built with a synthetic one. Demo is unchanged.
+    const build = () => createApp(authMode === undefined ? {} : { authMode });
+    const server = (authMode === 'zoho' ? withAuthSecret(TEST_SIGNING_SECRET, build) : build()).listen(0);
     await new Promise((r) => server.once('listening', r));
     return { server, base: `http://127.0.0.1:${server.address().port}/api/v1` };
   };
